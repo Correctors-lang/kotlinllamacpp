@@ -26,6 +26,37 @@ static inline int min(int a, int b) {
     return (a < b) ? a : b;
 }
 
+// Le journal INTERNE de llama.cpp, renvoyé vers logcat.
+//
+// Sans lui, le moteur dit tout ce qu'il fait — backend choisi, couches
+// déportées sur le GPU, tailles des tampons — et personne ne l'entend : rien
+// ne sortait de la bibliothèque. Impossible, depuis l'application, de
+// répondre à la seule question qui compte quand on vise l'accélération
+// matérielle : les couches sont-elles RÉELLEMENT parties sur le GPU ? On
+// pouvait la déduire du temps de chargement et du débit ; on ne pouvait pas
+// la constater.
+//
+// Le retour à la ligne final est retiré : llama.cpp termine ses messages par
+// une fin de ligne, logcat en ajoute une, ce qui produirait une ligne vide
+// sur deux.
+static void rnllama_log_to_logcat(lm_ggml_log_level level, const char * text, void * user_data) {
+    UNUSED(user_data);
+    if (text == nullptr) return;
+    std::string ligne(text);
+    while (!ligne.empty() && (ligne.back() == '\n' || ligne.back() == '\r')) {
+        ligne.pop_back();
+    }
+    if (ligne.empty()) return;
+    int prio;
+    switch (level) {
+        case LM_GGML_LOG_LEVEL_ERROR: prio = ANDROID_LOG_ERROR; break;
+        case LM_GGML_LOG_LEVEL_WARN:  prio = ANDROID_LOG_WARN;  break;
+        case LM_GGML_LOG_LEVEL_DEBUG: prio = ANDROID_LOG_DEBUG; break;
+        default:                      prio = ANDROID_LOG_INFO;  break;
+    }
+    __android_log_print(prio, "RNLlamaEngine", "%s", ligne.c_str());
+}
+
 extern "C" {
 
 // Helper method to create a Java HashMap
@@ -224,6 +255,12 @@ Java_org_nehuatl_llamacpp_LlamaContext_initContextWithFd(
 ) {
     UNUSED(thiz);
 
+    // Posé avant toute initialisation : les lignes qui nous intéressent
+    // (« offloaded N/M layers to GPU ») sont écrites PENDANT le chargement.
+    // Réinstallé à chaque appel plutôt qu'une fois pour toutes : c'est
+    // idempotent, et ça évite de dépendre d'un `JNI_OnLoad` absent ici.
+    llama_log_set(rnllama_log_to_logcat, nullptr);
+
     common_params defaultParams;
 
     defaultParams.vocab_only = vocab_only;
@@ -256,8 +293,24 @@ Java_org_nehuatl_llamacpp_LlamaContext_initContextWithFd(
             n_threads > 0 ? n_threads : auto_threads;
 
     defaultParams.n_gpu_layers = n_gpu_layers;
-    defaultParams.use_mlock = use_mlock;
-    defaultParams.use_mmap = use_mmap;
+    // llama.cpp a remplacé les deux booléens `use_mmap`/`use_mlock` par un
+    // seul `load_mode`. On traduit ici plutôt que côté Kotlin : l'API de la
+    // bibliothèque garde ses deux paramètres, les appelants ne changent pas.
+    //
+    // `MLOCK` mérite d'être souligné : il épingle les poids en RAM. Sur un
+    // téléphone sous pression mémoire, le modèle est sinon paginé hors RAM et
+    // relu depuis le stockage à chaque jeton — mesuré sur cet appareil :
+    // 0,47 jeton/s au lieu de 7,36, avec 106 000 défauts de page majeurs par
+    // minute.
+    if (use_mmap && use_mlock) {
+        defaultParams.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK;
+    } else if (use_mmap) {
+        defaultParams.load_mode = LLAMA_LOAD_MODE_MMAP;
+    } else if (use_mlock) {
+        defaultParams.load_mode = LLAMA_LOAD_MODE_MLOCK;
+    } else {
+        defaultParams.load_mode = LLAMA_LOAD_MODE_NONE;
+    }
 
     const char *lora_chars = env->GetStringUTFChars(lora_str, nullptr);
     if (lora_chars && lora_chars[0] != '\0') {

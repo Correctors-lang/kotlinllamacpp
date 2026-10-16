@@ -1,7 +1,7 @@
 #include "models.h"
 
 lm_ggml_cgraph * clip_graph_whisper_enc::build() {
-    const int n_frames = img.nx;
+    const int n_frames = img.nx();
     const int n_pos    = n_frames / 2;
     LM_GGML_ASSERT(model.position_embeddings->ne[1] >= n_pos);
 
@@ -94,6 +94,28 @@ lm_ggml_cgraph * clip_graph_whisper_enc::build() {
             model.mm_2_w, model.mm_2_b,
             FFN_GELU_ERF,
             -1);
+
+    } else if (proj_type == PROJECTOR_TYPE_MERALION) {
+        // stack (above) -> ln -> linear0+silu -> GLU -> out
+        cur = lm_ggml_norm(ctx0, cur, hparams.eps);
+        cur = lm_ggml_mul(ctx0, cur, model.mm_norm_pre_w);
+        cur = lm_ggml_add(ctx0, cur, model.mm_norm_pre_b);
+
+        cur = lm_ggml_mul_mat(ctx0, model.mm_0_w, cur);
+        cur = lm_ggml_add(ctx0, cur, model.mm_0_b);
+        cur = lm_ggml_silu(ctx0, cur);
+
+        lm_ggml_tensor * gate = lm_ggml_mul_mat(ctx0, model.mm_1_w, cur);
+        gate = lm_ggml_add(ctx0, gate, model.mm_1_b);
+        gate = lm_ggml_silu(ctx0, gate);
+
+        lm_ggml_tensor * pool = lm_ggml_mul_mat(ctx0, model.mm_2_w, cur);
+        pool = lm_ggml_add(ctx0, pool, model.mm_2_b);
+
+        cur = lm_ggml_mul(ctx0, gate, pool);
+
+        cur = lm_ggml_mul_mat(ctx0, model.mm_3_w, cur);
+        cur = lm_ggml_add(ctx0, cur, model.mm_3_b);
 
     } else if (proj_type == PROJECTOR_TYPE_GLMA) {
             cur = lm_ggml_norm(ctx0, cur, hparams.eps);

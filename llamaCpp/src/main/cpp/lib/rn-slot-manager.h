@@ -38,6 +38,12 @@ struct llama_rn_parallel_status {
     std::vector<llama_rn_request_status> requests;
 };
 
+enum class llama_rn_cancel_result {
+    ACTIVE,
+    QUEUED,
+    NOT_FOUND,
+};
+
 // Queued request structure
 struct llama_rn_queued_request {
     int32_t request_id;
@@ -100,11 +106,24 @@ struct llama_rn_slot_manager {
 
     // Request tracking
     std::map<int32_t, llama_rn_slot*> active_requests;  // request_id -> slot
-    int32_t next_request_id;
+    std::atomic<int32_t> next_request_id;
 
     // Batch processing
     llama_batch batch;
     int32_t n_batch;                       // Max batch size
+
+    // Shared MTP speculative decoding state. llama.cpp's MTP driver is
+    // multi-sequence, so queued slots borrow this instead of creating one
+    // speculative context per slot.
+    common_speculative *mtp_spec = nullptr;
+    llama_context *mtp_spec_ctx = nullptr;
+    int32_t mtp_spec_n_max = 0;
+    int32_t mtp_spec_n_min = 0;
+    float mtp_spec_p_min = 0.0f;
+    bool mtp_spec_backend_sampling = true;
+    int32_t mtp_spec_n_gpu_layers = -1;
+    lm_ggml_type mtp_spec_cache_type_k = LM_GGML_TYPE_F16;
+    lm_ggml_type mtp_spec_cache_type_v = LM_GGML_TYPE_F16;
 
     // Configuration
     float slot_prompt_similarity;          // Threshold for cache reuse (0.0-1.0)
@@ -131,6 +150,8 @@ struct llama_rn_slot_manager {
     bool init(int32_t n_parallel, int32_t n_batch, int32_t n_ctx);
 
     // Request management
+    int32_t reserve_request_id();
+
     int32_t queue_request(
         const common_params& params,
         const std::vector<llama_token>& prompt,
@@ -147,27 +168,30 @@ struct llama_rn_slot_manager {
         int32_t load_state_size,
         int32_t save_state_size,
         std::function<void(const completion_token_output&)> on_token,
-        std::function<void(llama_rn_slot*)> on_complete
+        std::function<void(llama_rn_slot*)> on_complete,
+        int32_t request_id = -1
     );
 
     int32_t queue_embedding_request(
         const std::vector<llama_token>& tokens,
         int embd_normalize,
-        std::function<void(int32_t, const std::vector<float>&)> on_result
+        std::function<void(int32_t, const std::vector<float>&)> on_result,
+        int32_t request_id = -1
     );
 
     int32_t queue_rerank_request(
         const std::string& query,
         const std::vector<std::string>& documents,
         int normalize,
-        std::function<void(int32_t, const std::vector<float>&)> on_results
+        std::function<void(int32_t, const std::vector<float>&)> on_results,
+        int32_t request_id = -1
     );
 
     // Slot management
     llama_rn_slot* get_available_slot(const std::vector<llama_token>& prompt);
     llama_rn_slot* get_slot_by_request_id(int32_t request_id);
     void release_slot(llama_rn_slot* slot);
-    void cancel_request(int32_t request_id);
+    llama_rn_cancel_result cancel_request(int32_t request_id);
 
     // Processing loop management
     void start_processing_loop();
@@ -183,6 +207,12 @@ struct llama_rn_slot_manager {
     bool process_batch();
     void sample_and_callback();
 
+    // Finish a slot's generation: flush the UTF-8 gate, mark done, notify
+    void complete_slot(llama_rn_slot & slot);
+    common_speculative* ensure_mtp_speculative(common_params& params);
+    llama_context* get_mtp_draft_context() const;
+    void reset_mtp_speculative();
+
     // Process pending queue
     void process_pending_queue();
 
@@ -191,6 +221,7 @@ struct llama_rn_slot_manager {
 
     // Status methods
     llama_rn_parallel_status get_status();
+    bool has_pending_work();
     void notify_status_change();
     int32_t add_status_subscriber(std::function<void(const llama_rn_parallel_status&)> callback);
     void remove_status_subscriber(int32_t subscriber_id);

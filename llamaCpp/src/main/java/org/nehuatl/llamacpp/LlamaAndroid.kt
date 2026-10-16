@@ -34,8 +34,29 @@ class LlamaAndroid(val resolver: ContentResolver) {
 
                 when {
                     isAtLeastArmV82 && hasDotProd && hasI8mm -> {
-                        Log.d(NAME, "Loading librnllama_v8_2_dotprod_i8mm.so")
-                        System.loadLibrary("rnllama_v8_2_dotprod_i8mm")
+                        // Variante GPU d'abord : elle contient le backend
+                        // OpenCL (Adreno) EN PLUS des mêmes noyaux ARM que la
+                        // variante CPU. Elle ne force rien — c'est
+                        // `n_gpu_layers` qui décide ensuite si le calcul part
+                        // sur le GPU (>0) ou reste sur le processeur (0). Une
+                        // seule bibliothèque permet donc de comparer les deux
+                        // sans réinstaller.
+                        //
+                        // Le repli n'est pas théorique : cette variante est
+                        // liée à `libOpenCL.so`, absente des appareils sans
+                        // pilote OpenCL. `System.loadLibrary` y échoue par
+                        // `UnsatisfiedLinkError` — on retombe alors sur la
+                        // variante CPU, qui est exactement ce qui était
+                        // chargé jusqu'ici.
+                        val chargee = runCatching {
+                            System.loadLibrary("rnllama_v8_2_dotprod_i8mm_opencl")
+                            "librnllama_v8_2_dotprod_i8mm_opencl.so (OpenCL disponible)"
+                        }.getOrElse { erreur ->
+                            Log.w(NAME, "OpenCL indisponible, repli processeur", erreur)
+                            System.loadLibrary("rnllama_v8_2_dotprod_i8mm")
+                            "librnllama_v8_2_dotprod_i8mm.so (processeur seul)"
+                        }
+                        Log.d(NAME, "Loading $chargee")
                     }
                     isAtLeastArmV82 && hasDotProd -> {
                         Log.d(NAME, "Loading librnllama_v8_2_dotprod.so")

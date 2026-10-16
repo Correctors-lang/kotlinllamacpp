@@ -2,6 +2,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 #include "ggml-impl.h"
+
 #include <assert.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -149,7 +150,7 @@ static void lm_ggml_dyn_tallocr_insert_block(struct tallocr_chunk * chunk, size_
 
 static void lm_ggml_dyn_tallocr_remove_block(struct tallocr_chunk * chunk, int idx) {
     // shift all elements after idx by 1 to the left, overwriting the element at idx
-    for (int i = idx; i < chunk->n_free_blocks; i++) {
+    for (int i = idx; i < chunk->n_free_blocks - 1; i++) {
         chunk->free_blocks[i] = chunk->free_blocks[i+1];
     }
     chunk->n_free_blocks--;
@@ -1236,6 +1237,9 @@ size_t lm_ggml_backend_alloc_ctx_tensors_from_buft_size(struct lm_ggml_context *
 
 lm_ggml_backend_buffer_t lm_ggml_backend_alloc_ctx_tensors_from_buft(struct lm_ggml_context * ctx, lm_ggml_backend_buffer_type_t buft) {
     size_t nbytes_total = 0;
+    if (lm_ggml_backend_buft_is_meta(buft)) {
+        return lm_ggml_backend_meta_alloc_ctx_tensors_from_buft(ctx, buft);
+    }
     return lm_ggml_backend_alloc_ctx_tensors_from_buft_impl(ctx, buft, &nbytes_total, /*no_alloc =*/ false);
 }
 

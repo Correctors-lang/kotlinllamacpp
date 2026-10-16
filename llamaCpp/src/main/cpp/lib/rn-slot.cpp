@@ -1,10 +1,14 @@
 #include "rn-slot.h"
 #include "rn-completion.h"
 #include "rn-llama.h"
+#include "rn-slot-manager.h"
 #include "rn-common.hpp"
 #include "chat.h"
+#include <algorithm>
 #include <cstring>
+#include <limits>
 #include <mutex>
+#include <stdexcept>
 
 namespace rnllama {
 
@@ -31,7 +35,9 @@ llama_rn_slot::llama_rn_slot() :
     stopped_limit(false),
     current_chat_format(0),
     current_reasoning_format(COMMON_REASONING_FORMAT_NONE),
+    params(nullptr),
     ctx_sampling(nullptr),
+    spec_is_shared(false),
     t_start_process(0),
     t_start_generation(0),
     t_last_used(0),
@@ -46,12 +52,15 @@ llama_rn_slot::llama_rn_slot() :
     load_state_size(-1),
     save_state_size(-1),
     save_prompt_state_pending(false),
-    save_prompt_state_tokens(-1)
+    save_prompt_state_tokens(-1),
+    num_draft_tokens(0),
+    num_draft_tokens_accepted(0)
 {
 }
 
 // Destructor
 llama_rn_slot::~llama_rn_slot() {
+    reset_speculative();
     if (ctx_sampling != nullptr) {
         common_sampler_free(ctx_sampling);
         ctx_sampling = nullptr;
@@ -66,11 +75,12 @@ void llama_rn_slot::reset() {
     n_decoded = 0;
     n_remaining = -1;
     i_batch = -1;
+    params = nullptr;
 
     // Clear token vectors
     prompt_tokens.clear();
     generated_tokens.clear();
-    generated_text.clear();
+    clear_generation_state();
     embd.clear();
 
     // Reset state fields
@@ -87,12 +97,17 @@ void llama_rn_slot::reset() {
     stopping_word.clear();
     stop_words.clear();
     error_message.clear();
+    num_draft_tokens = 0;
+    num_draft_tokens_accepted = 0;
+    reset_speculative();
 
     // Clear multimodal state
-    bitmap_past_hashes.clear();
+    // Note: bitmap_past_hashes is kept alongside cache_tokens - it describes
+    // the media positions still alive in this slot's sequence memory
     media_paths.clear();
     prompt_text.clear();
     media_processed = false;
+    media_pending_token = LLAMA_TOKEN_NULL;
 
     // Reset chat parsing state
     current_chat_format = 0;
@@ -156,9 +171,7 @@ void llama_rn_slot::load_prompt(const std::vector<llama_token>& tokens) {
     prompt_tokens = tokens;
     num_prompt_tokens = tokens.size();
     state = SLOT_STATE_PROCESSING_PROMPT;
-
-    // Check if we have loaded state
-    bool has_loaded_state = (!load_state_path.empty() && !cache_tokens.empty());
+    n_decoded = 0;
 
     // Check if model is recurrent/hybrid - needs special handling for state reuse
     bool is_recurrent_or_hybrid = false;
@@ -167,7 +180,16 @@ void llama_rn_slot::load_prompt(const std::vector<llama_token>& tokens) {
         is_recurrent_or_hybrid = llama_model_is_recurrent(model) || llama_model_is_hybrid(model);
     }
 
-    if (has_loaded_state) {
+    // Deferred media prompts: processMedia() owns prefix matching, media
+    // identity checks and memory reconciliation (the slot manager seeds it
+    // with cache_tokens). Touching the sequence memory here would strip media
+    // positions it may still be able to reuse.
+    if (!media_processed && !media_paths.empty()) {
+        n_past = 0;
+        n_prompt_tokens_cache = 0;
+        LOG_VERBOSE("Slot %d (req=%d): Media prompt, deferring memory reuse to processMedia (%zu cached tokens)",
+                   id, request_id, cache_tokens.size());
+    } else if (!load_state_path.empty() && !cache_tokens.empty()) {
         // Find how many tokens match between cached state and new prompt
         size_t n_matching = find_common_prefix_length(cache_tokens, tokens);
 
@@ -185,7 +207,6 @@ void llama_rn_slot::load_prompt(const std::vector<llama_token>& tokens) {
         }
 
         if (can_reuse_state) {
-            // We can reuse the KV cache for the matching prefix
             LOG_INFO("Slot %d (req=%d): Reusing loaded state (%zu matching tokens from %zu cached, %zu prompt tokens)",
                      id, request_id, n_matching, cache_tokens.size(), tokens.size());
 
@@ -194,58 +215,59 @@ void llama_rn_slot::load_prompt(const std::vector<llama_token>& tokens) {
             // the last token gets added to the batch.
             if (n_matching == tokens.size() && n_matching > 0) {
                 n_past = n_matching - 1;
-                n_prompt_tokens_cache = n_matching - 1;
                 LOG_INFO("Slot %d: Full prompt cached, will re-eval last token for fresh logits", id);
             } else {
                 // Partial match - set n_past to the matching prefix length
                 // Remaining tokens will be processed through build_batch
                 n_past = n_matching;
-                n_prompt_tokens_cache = n_matching;
-            }
-            n_decoded = 0;
-
-            // Clear KV cache beyond the reusable prefix
-            if (parent_ctx && parent_ctx->ctx) {
-                auto * kv = llama_get_memory(parent_ctx->ctx);
-                llama_memory_seq_rm(kv, id, n_past, -1);
-                LOG_VERBOSE("Slot %d: Cleared KV cache beyond position %d", id, n_past);
             }
 
-            // Update cache_tokens to include the full prompt
+            // Roll the memory back to the reusable prefix; falls back to a
+            // cold start when the memory can't resume there (recurrent/hybrid
+            // rollback limits, SWA pruning). The reused prefix is common with
+            // a text prompt, so it cannot contain media placeholders.
+            n_past = reconcile_memory_to(n_past, /*tokens_have_media*/ false);
+            n_prompt_tokens_cache = n_past;
+
+            // Update cache_tokens to include the full prompt. A text prompt
+            // never matches media placeholders, so no media survives in the
+            // retained prefix - drop the now-stale identity hashes
             cache_tokens = tokens;
+            bitmap_past_hashes.clear();
         } else {
             // No matching tokens, start fresh
             LOG_WARNING("Slot %d (req=%d): Loaded state doesn't match prompt (0 matching tokens), clearing cache",
                        id, request_id);
 
             n_past = 0;
-            n_decoded = 0;
             n_prompt_tokens_cache = 0;
 
             // Clear KV cache for this slot's sequence
             if (parent_ctx && parent_ctx->ctx) {
                 auto * kv = llama_get_memory(parent_ctx->ctx);
-                llama_memory_seq_rm(kv, id, 0, parent_ctx->params.n_ctx);
-                LOG_VERBOSE("Slot %d: Cleared KV cache for sequence (0 to %d)", id, parent_ctx->params.n_ctx);
+                llama_memory_seq_rm(kv, id, 0, -1);
+                LOG_VERBOSE("Slot %d: Cleared KV cache for sequence", id);
             }
 
             cache_tokens = tokens;
+            bitmap_past_hashes.clear();
         }
     } else {
         // No loaded state, start fresh
         n_past = 0;
-        n_decoded = 0;
         n_prompt_tokens_cache = 0;
 
         // Clear KV cache for this slot's sequence to ensure clean state
         if (parent_ctx && parent_ctx->ctx) {
             auto * kv = llama_get_memory(parent_ctx->ctx);
-            llama_memory_seq_rm(kv, id, 0, parent_ctx->params.n_ctx);
-            LOG_VERBOSE("Slot %d: Cleared KV cache for sequence (0 to %d)", id, parent_ctx->params.n_ctx);
+            llama_memory_seq_rm(kv, id, 0, -1);
+            LOG_VERBOSE("Slot %d: Cleared KV cache for sequence", id);
         }
 
-        // Initialize cache_tokens with prompt tokens
+        // Initialize cache_tokens with prompt tokens; any previous media in
+        // this slot's memory is gone with the clear
         cache_tokens = tokens;
+        bitmap_past_hashes.clear();
     }
 
     // Configure prompt checkpointing for recurrent/hybrid models when save_state_size is provided
@@ -308,6 +330,288 @@ completion_token_output llama_rn_slot::get_next_token() {
     return output;
 }
 
+bool llama_rn_slot::should_use_mtp() const {
+    if (params == nullptr || params->speculative.draft.n_max <= 0) {
+        return false;
+    }
+
+    const auto & types = params->speculative.types;
+    return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end();
+}
+
+void llama_rn_slot::reset_speculative() {
+    if (spec != nullptr) {
+        if (!spec_is_shared) {
+            common_speculative_free(spec);
+        }
+        spec = nullptr;
+    }
+    if (spec_ctx != nullptr) {
+        if (!spec_is_shared) {
+            llama_free(spec_ctx);
+        }
+        spec_ctx = nullptr;
+    }
+    spec_is_shared = false;
+    if (spec_batch_initialized) {
+        llama_batch_free(spec_batch);
+        spec_batch = {};
+        spec_batch_initialized = false;
+    }
+    spec_prompt.clear();
+    spec_id_last = LLAMA_TOKEN_NULL;
+    spec_n_past = 0;
+    spec_draft.clear();
+    spec_pending_tokens.clear();
+}
+
+void llama_rn_slot::init_mtp() {
+    if (!should_use_mtp() || spec != nullptr) {
+        return;
+    }
+    if (parent_ctx == nullptr || parent_ctx->ctx == nullptr || parent_ctx->model == nullptr) {
+        throw std::runtime_error("MTP speculative decoding requires an initialized context");
+    }
+    if (llama_model_has_encoder(parent_ctx->model)) {
+        throw std::runtime_error("MTP speculative decoding is only supported for decoder-only models");
+    }
+    if (!media_paths.empty()) {
+        throw std::runtime_error("MTP speculative decoding currently supports text-only queued completions");
+    }
+    if (prompt_tokens.empty()) {
+        throw std::runtime_error("MTP speculative decoding requires a non-empty prompt");
+    }
+    if (!load_state_path.empty() || !save_prompt_state_path.empty()) {
+        throw std::runtime_error("MTP speculative decoding for queued completions does not support prompt state load/save");
+    }
+
+    const auto n_mtp = params->speculative.draft.n_max;
+    if ((llama_model_is_recurrent(parent_ctx->model) || llama_model_is_hybrid(parent_ctx->model)) &&
+        llama_n_rs_seq(parent_ctx->ctx) < (uint32_t) n_mtp) {
+        throw std::runtime_error(
+            "MTP for recurrent or hybrid models must be enabled when loading the model "
+            "with speculative.type='draft-mtp' and speculative.n_max/spec_draft_n_max set");
+    }
+
+    reset_speculative();
+
+    if (parent_ctx->slot_manager != nullptr) {
+        spec = parent_ctx->slot_manager->ensure_mtp_speculative(*params);
+        spec_ctx = parent_ctx->slot_manager->get_mtp_draft_context();
+        spec_is_shared = true;
+    } else {
+        spec_ctx = parent_ctx->createMTPDraftContext(*params);
+        if (spec_ctx == nullptr) {
+            throw std::runtime_error("failed to create MTP draft context");
+        }
+
+        params->speculative.draft.ctx_tgt = parent_ctx->ctx;
+        params->speculative.draft.ctx_dft = spec_ctx;
+
+        const uint32_t n_seq = std::max<uint32_t>(
+            (uint32_t) std::max<int32_t>(1, params->n_parallel),
+            (uint32_t) id + 1);
+        spec = common_speculative_init(params->speculative, n_seq);
+        if (spec == nullptr) {
+            throw std::runtime_error("failed to initialize MTP speculative decoding");
+        }
+    }
+
+    spec_batch = llama_batch_init(llama_n_batch(parent_ctx->ctx), 0, 1);
+    spec_batch_initialized = true;
+
+    common_memory memory;
+    memory.init(parent_ctx->ctx, spec_ctx);
+    memory.seq_rm(id, -1, -1);
+    n_past = 0;
+
+    eval_mtp_prompt();
+
+    const int64_t t_now = lm_ggml_time_us();
+    t_start_generation = t_now;
+    t_prompt_processing = (t_start_generation - t_start_process) / 1e6;
+    prompt_processing_finished = false;
+    n_prompt_tokens_processed = num_prompt_tokens - n_prompt_tokens_cache;
+}
+
+void llama_rn_slot::eval_mtp_prompt() {
+    const llama_seq_id seq_id = id;
+    const size_t n_prompt = prompt_tokens.size();
+
+    spec_prompt.clear();
+    spec_pending_tokens.clear();
+    spec_draft.clear();
+    spec_id_last = prompt_tokens.back();
+
+    if (n_prompt > 1) {
+        spec_prompt.assign(prompt_tokens.begin(), prompt_tokens.end() - 1);
+    }
+
+    const int32_t n_batch = std::max<int32_t>(1, llama_n_batch(parent_ctx->ctx));
+    size_t offset = 0;
+
+    while (offset < spec_prompt.size()) {
+        common_batch_clear(spec_batch);
+
+        const size_t n_eval = std::min<size_t>(n_batch, spec_prompt.size() - offset);
+        for (size_t i = 0; i < n_eval; ++i) {
+            const bool needs_logits = i + 1 == n_eval;
+            common_batch_add(spec_batch, spec_prompt[offset + i],
+                             (llama_pos) (offset + i), { seq_id }, needs_logits);
+        }
+
+        const int ret = llama_decode(parent_ctx->ctx, spec_batch);
+        if (ret != 0) {
+            throw std::runtime_error("failed to evaluate MTP prompt batch, ret=" + std::to_string(ret));
+        }
+        if (!common_speculative_process(spec, spec_batch)) {
+            throw std::runtime_error("failed to process MTP prompt batch");
+        }
+
+        offset += n_eval;
+    }
+
+    spec_n_past = (llama_pos) spec_prompt.size();
+    n_past = spec_n_past;
+
+    common_speculative_begin(spec, seq_id, spec_prompt);
+}
+
+bool llama_rn_slot::refill_mtp_tokens() {
+    const llama_seq_id seq_id = id;
+
+    if (spec_id_last == LLAMA_TOKEN_NULL || stopped_eos || stopped_limit || context_full) {
+        return false;
+    }
+    if (n_remaining == 0) {
+        stopped_limit = true;
+        return false;
+    }
+
+    if (spec_n_past + 1 >= n_ctx) {
+        context_full = true;
+        return false;
+    }
+
+    spec_draft.clear();
+
+    const int32_t remaining = n_remaining < 0
+        ? std::numeric_limits<int32_t>::max()
+        : n_remaining;
+    const int32_t n_draft_remaining = remaining == std::numeric_limits<int32_t>::max()
+        ? params->speculative.draft.n_max
+        : std::max<int32_t>(0, remaining - 1);
+    const int32_t n_draft_ctx = std::max<int32_t>(0, n_ctx - (int32_t) spec_n_past - 1);
+    const int32_t n_draft_batch = std::max<int32_t>(0, llama_n_batch(parent_ctx->ctx) - 1);
+    const int32_t n_draft_limit = std::min<int32_t>(
+        params->speculative.draft.n_max,
+        std::min<int32_t>(n_draft_remaining, std::min<int32_t>(n_draft_ctx, n_draft_batch)));
+
+    if (n_draft_limit > 0) {
+        common_speculative_get_draft_params(spec, seq_id) = {
+            /* .drafting = */ true,
+            /* .n_max    = */ n_draft_limit,
+            /* .n_past   = */ spec_n_past,
+            /* .id_last  = */ spec_id_last,
+            /* .prompt   = */ &spec_prompt,
+            /* .result   = */ &spec_draft,
+        };
+        common_speculative_draft(spec);
+
+        if ((int32_t) spec_draft.size() > n_draft_limit) {
+            spec_draft.resize(n_draft_limit);
+        }
+
+        common_memory memory;
+        memory.init(spec_ctx);
+        memory.seq_rm(seq_id, spec_n_past, -1);
+    }
+
+    const size_t n_draft = spec_draft.size();
+    num_draft_tokens += n_draft;
+
+    common_batch_clear(spec_batch);
+    common_batch_add(spec_batch, spec_id_last, spec_n_past, { seq_id }, true);
+    for (size_t i = 0; i < n_draft; ++i) {
+        common_batch_add(spec_batch, spec_draft[i],
+                         spec_n_past + (llama_pos) i + 1, { seq_id }, true);
+    }
+
+    const int ret = llama_decode(parent_ctx->ctx, spec_batch);
+    if (ret != 0) {
+        throw std::runtime_error("failed to evaluate MTP target batch, ret=" + std::to_string(ret));
+    }
+    if (!common_speculative_process(spec, spec_batch)) {
+        throw std::runtime_error("failed to process MTP target batch");
+    }
+
+    auto accepted = common_sampler_sample_and_accept_n(ctx_sampling, parent_ctx->ctx, spec_draft);
+    if (accepted.empty()) {
+        return false;
+    }
+
+    size_t accepted_count = accepted.size();
+    bool saw_eos = false;
+    const llama_vocab* vocab = llama_model_get_vocab(parent_ctx->model);
+    for (size_t i = 0; i < accepted.size(); ++i) {
+        if (llama_vocab_is_eog(vocab, accepted[i])) {
+            accepted_count = i + 1;
+            saw_eos = true;
+            break;
+        }
+
+        spec_pending_tokens.push_back(accepted[i]);
+    }
+
+    const size_t n_accepted_draft = saw_eos
+        ? accepted_count - 1
+        : accepted.size() - 1;
+    if (n_draft > 0) {
+        const size_t n_accepted = std::min(n_accepted_draft, n_draft);
+        num_draft_tokens_accepted += n_accepted;
+        common_speculative_accept(spec, seq_id, (uint16_t) n_accepted);
+    }
+
+    for (size_t i = 0; i < accepted_count; ++i) {
+        spec_prompt.push_back(spec_id_last);
+        spec_id_last = accepted[i];
+    }
+
+    spec_n_past += (llama_pos) accepted_count;
+    n_past = spec_n_past;
+
+    common_memory memory;
+    memory.init(parent_ctx->ctx, spec_ctx);
+    memory.seq_rm(seq_id, spec_n_past, -1);
+
+    if (saw_eos) {
+        stopped_eos = true;
+    }
+
+    return !spec_pending_tokens.empty();
+}
+
+completion_token_output llama_rn_slot::next_token_mtp() {
+    completion_token_output result;
+    result.tok = -1;
+    result.request_id = request_id;
+
+    if (spec == nullptr) {
+        init_mtp();
+    }
+
+    if (spec_pending_tokens.empty() && !refill_mtp_tokens()) {
+        return result;
+    }
+
+    result.tok = spec_pending_tokens.front();
+    result.text = common_token_to_piece(parent_ctx->ctx, result.tok);
+    spec_pending_tokens.pop_front();
+    result.request_id = request_id;
+    num_tokens_predicted++;
+    return result;
+}
+
 // Parse chat output (tool calls, reasoning content, etc.)
 completion_chat_output llama_rn_slot::parseChatOutput(bool is_partial) {
     common_chat_parser_params syntax;
@@ -356,6 +660,89 @@ slot_timings llama_rn_slot::get_timings() const {
     return timings;
 }
 
+llama_pos llama_rn_slot::reconcile_memory_to(llama_pos n_keep, bool tokens_have_media) {
+    if (!parent_ctx || !parent_ctx->ctx) {
+        return 0;
+    }
+
+    auto * kv = llama_get_memory(parent_ctx->ctx);
+
+    if (n_keep <= 0) {
+        llama_memory_seq_rm(kv, id, 0, -1);
+        return 0;
+    }
+
+    const llama_model * mdl = llama_get_model(parent_ctx->ctx);
+    // M-RoPE media prefixes hold fewer time positions than placeholder tokens,
+    // so the frontier may legitimately sit below n_keep - but only when the
+    // token list actually holds media; for a text-only list a lagging frontier
+    // can only mean an inconsistent state (e.g. a legacy file whose last
+    // sampled token was never decoded)
+    const bool mrope_media = model_uses_mrope(mdl) && tokens_have_media;
+    const llama_pos pos_max = llama_memory_seq_pos_max(kv, id);
+
+    if (pos_max + 1 < n_keep) {
+        if (mrope_media && pos_max >= 0) {
+            return n_keep;
+        }
+        LOG_WARNING("Slot %d: Memory holds %lld positions but %lld tokens are expected, clearing sequence",
+                   id, (long long)(pos_max + 1), (long long)n_keep);
+        llama_memory_seq_rm(kv, id, 0, -1);
+        return 0;
+    }
+
+    if (pos_max + 1 == n_keep) {
+        // Appending at the frontier is always valid
+        return n_keep;
+    }
+
+    // Roll the sequence back to n_keep. Recurrent/hybrid memories may refuse
+    // (only a small rollback ring is available), in which case the state
+    // cannot be reused and the sequence must be reprocessed from scratch.
+    if (!llama_memory_seq_rm(kv, id, n_keep, -1)) {
+        LOG_WARNING("Slot %d: Cannot roll back memory from %lld to %lld positions (recurrent/hybrid), clearing sequence",
+                   id, (long long)(pos_max + 1), (long long)n_keep);
+        llama_memory_seq_rm(kv, id, 0, -1);
+        return 0;
+    }
+
+    // The removal may have emptied the cache entirely (e.g. an SWA window that
+    // sat wholly past n_keep); the frontier must land exactly at n_keep
+    // (below it is fine for M-RoPE media prefixes)
+    {
+        const llama_pos frontier = llama_memory_seq_pos_max(kv, id) + 1;
+        const bool frontier_ok = mrope_media ? (frontier > 0 && frontier <= n_keep)
+                                             : (frontier == n_keep);
+        if (!frontier_ok) {
+            LOG_WARNING("Slot %d: Memory frontier is %lld after rollback to %lld, clearing sequence",
+                       id, (long long)frontier, (long long)n_keep);
+            llama_memory_seq_rm(kv, id, 0, -1);
+            return 0;
+        }
+    }
+
+    // SWA caches prune cells behind the attention window; resuming at n_keep
+    // needs positions [n_keep - n_swa, n_keep) present. Same threshold as
+    // llama.cpp's server (pos_min_thold); pos_min == 0 means nothing pruned.
+    // Recurrent/hybrid models are exempt (their pos_min reflects the recurrent
+    // tail, and their rollback safety is enforced by seq_rm itself).
+    const bool is_recurrent_or_hybrid =
+        llama_model_is_recurrent(mdl) || llama_model_is_hybrid(mdl);
+    const int32_t n_swa = parent_ctx->params.swa_full ? 0 : llama_model_n_swa(mdl);
+    if (n_swa > 0 && !is_recurrent_or_hybrid) {
+        const llama_pos pos_min = llama_memory_seq_pos_min(kv, id);
+        const llama_pos pos_min_thold = std::max<llama_pos>(0, n_keep - n_swa);
+        if (pos_min < 0 || (pos_min > 0 && pos_min >= pos_min_thold)) {
+            LOG_WARNING("Slot %d: SWA cache lost positions below %lld (pos_min=%lld), clearing sequence for full reprocess",
+                       id, (long long)pos_min_thold, (long long)pos_min);
+            llama_memory_seq_rm(kv, id, 0, -1);
+            return 0;
+        }
+    }
+
+    return n_keep;
+}
+
 // Load state into this slot's sequence
 bool llama_rn_slot::load_state() {
     if (!parent_ctx || !parent_ctx->ctx) {
@@ -366,7 +753,11 @@ bool llama_rn_slot::load_state() {
 #ifdef LM_GGML_USE_OPENCL
     const auto &model_devices = parent_ctx->llama_init->model()->devices;
     auto has_opencl = false;
-    for (const auto &dev : model_devices) {
+    for (const auto &dev_info : model_devices) {
+        auto dev = dev_info.dev;
+        if (dev == nullptr) {
+            continue;
+        }
         const char *dev_name = lm_ggml_backend_dev_name(dev);
         if (strncmp(dev_name, "GPUOpenCL", 9) == 0) {
             has_opencl = true;
@@ -426,11 +817,30 @@ bool llama_rn_slot::load_state() {
             LOG_VERBOSE("Slot %d: Limiting loaded state from %zu to %d tokens",
                        id, state_tokens.size(), load_state_size);
             state_tokens.resize(load_state_size);
-
-            auto * kv = llama_get_memory(parent_ctx->ctx);
-            llama_memory_seq_rm(kv, id, load_state_size, -1);
         }
     }
+
+    // The loaded memory may hold more positions than the token list, e.g.
+    // legacy files saved from multimodal sequences (media positions were
+    // stripped from the tokens but not from the memory) or files trimmed via
+    // save_state_size. Reconcile so decoding can resume at the token count;
+    // when the memory can't be rolled back, degrade to a cold start instead
+    // of failing the batch later.
+    const bool tokens_have_media =
+        std::find(state_tokens.begin(), state_tokens.end(),
+                  LLAMA_TOKEN_NULL) != state_tokens.end();
+    const llama_pos usable =
+        reconcile_memory_to((llama_pos) state_tokens.size(), tokens_have_media);
+    if (usable < (llama_pos) state_tokens.size()) {
+        LOG_WARNING("Slot %d: Loaded state is not resumable, prompt will be reprocessed from scratch", id);
+        state_tokens.clear();
+    }
+
+    // Media identity for placeholder positions; absent for text-only or
+    // legacy files (media is then conservatively reprocessed)
+    bitmap_past_hashes = state_tokens.empty()
+        ? std::vector<std::string>{}
+        : read_state_meta(load_state_path);
 
     n_past = state_tokens.size();
     cache_tokens = std::move(state_tokens);
@@ -455,7 +865,11 @@ bool llama_rn_slot::save_prompt_state_checkpoint() {
 #ifdef LM_GGML_USE_OPENCL
     const auto &model_devices = parent_ctx->llama_init->model()->devices;
     auto has_opencl = false;
-    for (const auto &dev : model_devices) {
+    for (const auto &dev_info : model_devices) {
+        auto dev = dev_info.dev;
+        if (dev == nullptr) {
+            continue;
+        }
         const char *dev_name = lm_ggml_backend_dev_name(dev);
         if (strncmp(dev_name, "GPUOpenCL", 9) == 0) {
             has_opencl = true;
@@ -495,13 +909,10 @@ bool llama_rn_slot::save_prompt_state_checkpoint() {
         tokens_to_save = cache_tokens.size();
     }
 
+    // Keep LLAMA_TOKEN_NULL media placeholders: llama_state_seq_save_file
+    // always serializes the whole sequence memory, so the token list must
+    // cover the same positions or the file cannot be resumed
     std::vector<llama_token> state_tokens(cache_tokens.begin(), cache_tokens.begin() + tokens_to_save);
-
-    // Remove LLAMA_TOKEN_NULL tokens
-    auto null_token_iter = std::find(state_tokens.begin(), state_tokens.end(), LLAMA_TOKEN_NULL);
-    if (null_token_iter != state_tokens.end()) {
-        state_tokens.resize(std::distance(state_tokens.begin(), null_token_iter));
-    }
 
     size_t actual_save_size = state_tokens.size();
     if (actual_save_size == 0) {
@@ -532,6 +943,10 @@ bool llama_rn_slot::save_prompt_state_checkpoint() {
              cache_k,
              cache_v);
 
+    // Drop any previous sidecar before overwriting the state file so a
+    // failure in between can never pair stale hashes with the new file
+    write_state_meta(save_prompt_state_path, {});
+
     size_t nwrite = llama_state_seq_save_file(
         parent_ctx->ctx,
         save_prompt_state_path.c_str(),
@@ -544,6 +959,17 @@ bool llama_rn_slot::save_prompt_state_checkpoint() {
         LOG_ERROR("Slot %d: Failed to save prompt checkpoint to file: %s", id, save_prompt_state_path.c_str());
         return false;
     }
+
+    // Persist media identity only when the saved prefix actually holds media
+    // and no media position was cut off; anything else cannot be verified on
+    // reload (and hashes without placeholders would be stale)
+    const bool media_retained =
+        std::find(state_tokens.begin(), state_tokens.end(),
+                  LLAMA_TOKEN_NULL) != state_tokens.end() &&
+        std::find(cache_tokens.begin() + actual_save_size, cache_tokens.end(),
+                  LLAMA_TOKEN_NULL) == cache_tokens.end();
+    write_state_meta(save_prompt_state_path,
+                     media_retained ? bitmap_past_hashes : std::vector<std::string>{});
 
     LOG_INFO("Slot %d: Saved prompt checkpoint for %zu tokens (full state, %.2f KB)",
              id, actual_save_size, nwrite / 1024.0);
@@ -562,7 +988,11 @@ bool llama_rn_slot::save_state() {
 #ifdef LM_GGML_USE_OPENCL
     const auto &model_devices = parent_ctx->llama_init->model()->devices;
     auto has_opencl = false;
-    for (const auto &dev : model_devices) {
+    for (const auto &dev_info : model_devices) {
+        auto dev = dev_info.dev;
+        if (dev == nullptr) {
+            continue;
+        }
         const char *dev_name = lm_ggml_backend_dev_name(dev);
         if (strncmp(dev_name, "GPUOpenCL", 9) == 0) {
             has_opencl = true;
@@ -593,13 +1023,29 @@ bool llama_rn_slot::save_state() {
     const llama_model * model = llama_get_model(parent_ctx->ctx);
     const bool is_recurrent_or_hybrid = llama_model_is_recurrent(model) || llama_model_is_hybrid(model);
 
-    // Get tokens for this state (cache_tokens represents all processed tokens in KV cache)
+    // Get tokens for this state (cache_tokens represents all processed tokens
+    // in the sequence memory). LLAMA_TOKEN_NULL media placeholders are kept:
+    // llama_state_seq_save_file always serializes the whole sequence memory,
+    // so the token list must cover the same positions to stay resumable.
     std::vector<llama_token> state_tokens = cache_tokens;
 
-    // Remove LLAMA_TOKEN_NULL tokens
-    auto null_token_iter = std::find(state_tokens.begin(), state_tokens.end(), LLAMA_TOKEN_NULL);
-    if (null_token_iter != state_tokens.end()) {
-        state_tokens.resize(std::distance(state_tokens.begin(), null_token_iter));
+    // The last sampled token may never have been decoded (stop-word/limit
+    // stops); the memory only holds decoded positions and the token list
+    // must not claim more. M-RoPE media histories are exempt: their frontier
+    // legitimately lags the placeholder token count, so trimming to it would
+    // cut real tokens.
+    const bool mrope_media = model_uses_mrope(model) &&
+        std::find(state_tokens.begin(), state_tokens.end(),
+                  LLAMA_TOKEN_NULL) != state_tokens.end();
+    if (!mrope_media) {
+        auto * kv = llama_get_memory(parent_ctx->ctx);
+        const size_t decoded_count =
+            (size_t) std::max<llama_pos>(0, llama_memory_seq_pos_max(kv, id) + 1);
+        if (state_tokens.size() > decoded_count) {
+            LOG_VERBOSE("Slot %d: Trimming %zu undecoded token(s) from saved state",
+                       id, state_tokens.size() - decoded_count);
+            state_tokens.resize(decoded_count);
+        }
     }
 
     if (state_tokens.empty()) {
@@ -634,6 +1080,10 @@ bool llama_rn_slot::save_state() {
                        id, actual_save_size);
         }
     }
+
+    // Drop any previous sidecar before overwriting the state file so a
+    // failure in between can never pair stale hashes with the new file
+    write_state_meta(save_state_path, {});
 
     size_t nwrite = llama_state_seq_save_file(
         parent_ctx->ctx,
@@ -671,6 +1121,17 @@ bool llama_rn_slot::save_state() {
         LOG_ERROR("Slot %d: Failed to save state to file: %s", id, save_state_path.c_str());
         return false;
     }
+
+    // Persist media identity only when the saved prefix actually holds media
+    // and no media position was cut off; anything else cannot be verified on
+    // reload (and hashes without placeholders would be stale)
+    const bool media_retained =
+        std::find(state_tokens.begin(), state_tokens.begin() + actual_save_size,
+                  LLAMA_TOKEN_NULL) != state_tokens.begin() + actual_save_size &&
+        std::find(state_tokens.begin() + actual_save_size, state_tokens.end(),
+                  LLAMA_TOKEN_NULL) == state_tokens.end();
+    write_state_meta(save_state_path,
+                     media_retained ? bitmap_past_hashes : std::vector<std::string>{});
 
     // Calculate elapsed time
     const int64_t t_save_end = lm_ggml_time_us();

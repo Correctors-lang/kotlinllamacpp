@@ -3,9 +3,12 @@
 #include "rn-tts.h"
 #include "rn-mtmd.hpp"
 #include "rn-common.hpp"
+#include "llama-ext.h"  // llama_get_ctx_other (mem-shared MTP draft detection)
 
 #include <algorithm>
+#include <cstring>
 #include <cstdlib>
+#include <limits>
 
 // Include multimodal support
 #include "tools/mtmd/mtmd.h"
@@ -21,6 +24,7 @@ llama_rn_context_completion::llama_rn_context_completion(llama_rn_context* paren
 
 // Destructor
 llama_rn_context_completion::~llama_rn_context_completion() {
+    resetSpeculative();
     if (ctx_sampling != nullptr) {
         common_sampler_free(ctx_sampling);
         ctx_sampling = nullptr;
@@ -28,6 +32,7 @@ llama_rn_context_completion::~llama_rn_context_completion() {
 }
 
 void llama_rn_context_completion::rewind() {
+    resetSpeculative();
     is_interrupted = false;
     parent_ctx->params.antiprompt.clear();
     parent_ctx->params.sampling.grammar = {};
@@ -37,9 +42,15 @@ void llama_rn_context_completion::rewind() {
     parent_ctx->params.sampling.generation_prompt.clear();
     num_prompt_tokens = 0;
     num_tokens_predicted = 0;
+    num_draft_tokens = 0;
+    num_draft_tokens_accepted = 0;
+    resetGenerationTimings();
     prefill_text = "";
     generated_text = "";
     generated_text.reserve(parent_ctx->params.n_ctx);
+    embeddings.clear();
+    embedding_dim = 0;
+    utf8_gate.reset();
     truncated = false;
     context_full = false;
     stopped_eos = false;
@@ -51,9 +62,7 @@ void llama_rn_context_completion::rewind() {
     n_past = 0;
     parent_ctx->params.sampling.n_prev = parent_ctx->n_ctx;
     if (parent_ctx->isVocoderEnabled()) {
-        parent_ctx->tts_wrapper->audio_tokens.clear();
-        parent_ctx->tts_wrapper->next_token_uses_guide_token = true;
-        parent_ctx->tts_wrapper->guide_tokens.clear();
+        parent_ctx->tts_wrapper->reset();
     }
 }
 
@@ -63,6 +72,240 @@ bool llama_rn_context_completion::initSampling() {
     }
     ctx_sampling = common_sampler_init(parent_ctx->model, parent_ctx->params.sampling);
     return ctx_sampling != nullptr;
+}
+
+// ----------------------------------------------------------------------------
+// Prompt state cache (recurrent / hybrid / SWA prefix reuse)
+//
+// These memories can't roll back in place, so instead of full-clearing on
+// divergence we snapshot the non-rollbackable part (PARTIAL_ONLY) during prompt
+// ingest and restore the longest snapshot that prefixes the new prompt.
+// Single-sequence completion path only; the slot manager passes no callbacks
+// and keeps the full-clear behaviour.
+// ----------------------------------------------------------------------------
+
+void llama_rn_context_completion::probeStateCache() {
+    if (state_cache_probed) {
+        return;
+    }
+    state_cache_probed = true;
+
+    // Pull the host-configured bounds (set at model init) into effect.
+    state_cache_budget_bytes = parent_ctx->state_cache_budget_bytes;
+    // 0 = no count cap (budget-bound only); <0/unset keeps the default.
+    if (parent_ctx->state_cache_max_checkpoints > 0) {
+        state_cache_max_checkpoints = (size_t) parent_ctx->state_cache_max_checkpoints;
+    } else if (parent_ctx->state_cache_max_checkpoints == 0) {
+        state_cache_max_checkpoints = std::numeric_limits<size_t>::max();
+    }
+
+    const llama_model *model = parent_ctx->model;
+    if (model == nullptr || state_cache_budget_bytes == 0) {
+        // A zero budget is an explicit opt-out (keep the full-reprocess fallback).
+        state_cache_enabled = false;
+        return;
+    }
+    // Recurrent/hybrid only. Pure-SWA never fails seq_rm in this fork, so a
+    // checkpoint could never be restored — capturing would be pure cost.
+    // TODO: SWA reuse past a slid window (deep edit in a chat longer than the
+    // window) is unguarded here; a fix would need a pos_min trigger, not seq_rm.
+    state_cache_enabled =
+        llama_model_is_recurrent(model) ||
+        llama_model_is_hybrid(model);
+    if (state_cache_enabled) {
+        LOG_INFO("prompt state cache enabled (recurrent/hybrid model)");
+    }
+}
+
+void llama_rn_context_completion::evictStateCheckpoints() {
+    // Oldest first, but always keep the smallest-position snapshot: that is the
+    // first message boundary (system-prompt end) a brand-new session shares.
+    auto total_bytes = [&]() {
+        size_t n = 0;
+        for (const auto &c : state_checkpoints) n += c.size_bytes();
+        return n;
+    };
+    auto smallest_pos = [&]() {
+        size_t idx = 0;
+        for (size_t i = 1; i < state_checkpoints.size(); i++) {
+            if (state_checkpoints[i].n_tokens() < state_checkpoints[idx].n_tokens()) idx = i;
+        }
+        return idx;
+    };
+    while (state_checkpoints.size() > 1 &&
+           (state_checkpoints.size() > state_cache_max_checkpoints ||
+            total_bytes() > state_cache_budget_bytes)) {
+        const size_t keep = smallest_pos();
+        // Evict the oldest snapshot that is not the pinned stable-prefix one.
+        size_t victim = (keep == 0 && state_checkpoints.size() > 1) ? 1 : 0;
+        state_checkpoints.erase(state_checkpoints.begin() + victim);
+    }
+}
+
+void llama_rn_context_completion::clearStateCheckpoints() {
+    state_checkpoints.clear();
+    // Boundary positions index into the current prompt; invalidated together.
+    boundary_ckpts.clear();
+    prompt_checkpoint_pending = false;
+}
+
+void llama_rn_context_completion::eraseStateCheckpointAt(size_t n_tokens) {
+    state_checkpoints.erase(
+        std::remove_if(state_checkpoints.begin(), state_checkpoints.end(),
+            [&](const rn_state_checkpoint &c) { return c.n_tokens() == n_tokens; }),
+        state_checkpoints.end());
+}
+
+void llama_rn_context_completion::eraseStateCheckpointsAfter(size_t n_tokens) {
+    const size_t old_size = state_checkpoints.size();
+    state_checkpoints.erase(
+        std::remove_if(state_checkpoints.begin(), state_checkpoints.end(),
+            [&](const rn_state_checkpoint &c) { return c.n_tokens() > n_tokens; }),
+        state_checkpoints.end());
+    if (state_checkpoints.size() != old_size) {
+        LOG_VERBOSE("invalidated %zu state checkpoint(s) after position %zu",
+            old_size - state_checkpoints.size(), n_tokens);
+    }
+}
+
+void llama_rn_context_completion::captureStateCheckpoint() {
+    // The memory holds exactly embd[0, n_past).
+    if (n_past <= 0) {
+        return;
+    }
+    captureStateCheckpoint(embd, (size_t) n_past);
+}
+
+void llama_rn_context_completion::captureStateCheckpoint(
+        const std::vector<llama_token> &seq, size_t n) {
+    if (!state_cache_enabled || !state_cache_capture_allowed || parent_ctx->ctx == nullptr) {
+        return;
+    }
+    if (n == 0 || n > seq.size()) {
+        return;
+    }
+    // Already hold this exact snapshot (e.g. just restored): skip the readback.
+    for (const auto &c : state_checkpoints) {
+        if (c.n_tokens() == n &&
+            std::equal(c.tokens.begin(), c.tokens.end(), seq.begin())) {
+            return;
+        }
+    }
+
+    const size_t size = llama_state_seq_get_size_ext(
+        parent_ctx->ctx, /*seq_id*/ 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    if (size == 0) {
+        return;
+    }
+
+    // A hybrid's SWA cells grow ~linearly until the window fills (unlike its
+    // fixed-size recurrent cells). Extrapolate to saturation and disable if one
+    // snapshot would exceed half the budget. (Pure-SWA is gated off upstream.)
+    if (parent_ctx->model != nullptr && llama_model_n_swa(parent_ctx->model) > 0) {
+        const size_t n_swa = (size_t) llama_model_n_swa(parent_ctx->model);
+        const size_t fill  = std::min(n, n_swa);
+        const size_t saturated = size * n_swa / fill;
+        if (saturated > state_cache_budget_bytes / 2) {
+            LOG_WARNING(
+                "state cache disabled: a saturated snapshot would be ~%.1f MiB "
+                "(measured %.1f MiB at %zu/%zu window fill) vs a %.1f MiB budget",
+                saturated / (1024.0 * 1024.0), size / (1024.0 * 1024.0),
+                fill, n_swa, state_cache_budget_bytes / (1024.0 * 1024.0));
+            state_cache_enabled = false;
+            clearStateCheckpoints();
+            return;
+        }
+    }
+
+    rn_state_checkpoint ckpt;
+    ckpt.tokens.assign(seq.begin(), seq.begin() + n);
+    try {
+        ckpt.data.resize(size);
+    } catch (const std::bad_alloc &) {
+        // Skip the capture rather than aborting the completion.
+        LOG_WARNING("state checkpoint alloc failed (n_tokens=%zu, %.1f MiB)",
+            n, size / (1024.0 * 1024.0));
+        return;
+    }
+    const size_t written = llama_state_seq_get_data_ext(
+        parent_ctx->ctx, ckpt.data.data(), size, /*seq_id*/ 0,
+        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    if (written == 0) {
+        // Can fail under memory pressure; the old snapshot at this boundary
+        // is still valid and must survive a failed re-capture.
+        LOG_WARNING("state checkpoint capture failed (n_tokens=%zu)", n);
+        return;
+    }
+    ckpt.data.resize(written);
+
+    // Replace any snapshot at this boundary only after a successful capture
+    // (a stale same-length one would shadow the current tokens).
+    eraseStateCheckpointAt(n);
+    state_checkpoints.push_back(std::move(ckpt));
+    evictStateCheckpoints();
+    LOG_VERBOSE("captured state checkpoint: n_tokens=%zu, size=%.1f KiB, total=%zu",
+        n, written / 1024.0, state_checkpoints.size());
+}
+
+int llama_rn_context_completion::findStateCheckpoint(
+        const std::vector<llama_token> &target, size_t max_len) const {
+    // Pick the longest snapshot whose tokens are a prefix of `target` and whose
+    // length does not exceed `max_len` (the verified shared-prefix length).
+    int best = -1;
+    size_t best_len = 0;
+    for (size_t i = 0; i < state_checkpoints.size(); i++) {
+        const auto &c = state_checkpoints[i];
+        const size_t n = c.n_tokens();
+        if (n == 0 || n > max_len || n > target.size()) {
+            continue;
+        }
+        if (n <= best_len) {
+            continue; // can't beat the current best
+        }
+        if (std::equal(c.tokens.begin(), c.tokens.end(), target.begin())) {
+            best = (int) i;
+            best_len = n;
+        }
+    }
+    return best;
+}
+
+bool llama_rn_context_completion::recoverStateCheckpoint(
+        const std::vector<llama_token> &target, size_t max_reuse,
+        size_t total_tokens, llama_pos &n_past_out) {
+    if (parent_ctx->ctx == nullptr) {
+        return false;
+    }
+    auto * kv = llama_get_memory(parent_ctx->ctx);
+    // Never select a full-prompt snapshot: one token must remain to evaluate,
+    // and freeing it with a post-restore seq_rm(k-1) would roll back onto stale
+    // rollback-ring state. A shorter snapshot leaves room by construction.
+    const size_t search_max = total_tokens > 0 ? std::min(max_reuse, total_tokens - 1) : 0;
+    const int ckpt_idx = findStateCheckpoint(target, search_max);
+    if (ckpt_idx < 0 || !restoreStateCheckpoint((size_t) ckpt_idx)) {
+        return false;
+    }
+    const llama_pos k = (llama_pos) state_checkpoints[ckpt_idx].n_tokens();
+    // Recurrent part is back at k; truncating the live attention prefix to k
+    // succeeds since nothing remains past k.
+    llama_memory_seq_rm(kv, 0, k, -1);
+    n_past_out = k;
+    return true;
+}
+
+bool llama_rn_context_completion::restoreStateCheckpoint(size_t index) {
+    if (index >= state_checkpoints.size() || parent_ctx->ctx == nullptr) {
+        return false;
+    }
+    const auto &c = state_checkpoints[index];
+    const size_t read = llama_state_seq_set_data_ext(
+        parent_ctx->ctx, c.data.data(), c.data.size(), /*dest_seq_id*/ 0,
+        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    if (read == 0) {
+        LOG_WARNING("state checkpoint restore failed (n_tokens=%zu)", c.n_tokens());
+        return false;
+    }
+    return true;
 }
 
 void llama_rn_context_completion::truncatePrompt(std::vector<llama_token> &prompt_tokens) {
@@ -87,8 +330,57 @@ void llama_rn_context_completion::truncatePrompt(std::vector<llama_token> &promp
     prompt_tokens = new_tokens;
 }
 
-void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &media_paths) {
+std::vector<llama_pos> llama_rn_context_completion::computeMessageBoundaries(
+        const std::vector<llama_token> &tokens, llama_pos min_gap) const {
+    std::vector<llama_pos> out;
+    if (parent_ctx->model == nullptr) {
+        return out;
+    }
+    const auto vocab = llama_model_get_vocab(parent_ctx->model);
+    // A boundary is the first content token after a run of chat-template
+    // delimiter tokens (CONTROL/USER_DEFINED, template-agnostic; whitespace
+    // keeps a run open). History up to a boundary is identical in every future
+    // prompt sharing the conversation to that message — an exact restore point.
+    //
+    // min_gap: a snapshot < min_gap tokens past the previous restore point
+    // (position 0 counts as the first) saves less reprocess than the slot is
+    // worth. min_gap == 1 keeps every boundary (used to find the last one).
+    llama_pos last_accepted = 0;
+    bool run_has_delim = false;
+    for (size_t i = 0; i < tokens.size(); i++) {
+        if (tokens[i] < 0) {
+            run_has_delim = false; // media placeholder — not a vocab id
+            continue;
+        }
+        const unsigned attr = (unsigned) llama_vocab_get_attr(vocab, tokens[i]);
+        if ((attr & ((unsigned) LLAMA_TOKEN_ATTR_CONTROL |
+                     (unsigned) LLAMA_TOKEN_ATTR_USER_DEFINED)) != 0) {
+            run_has_delim = true;
+            continue;
+        }
+        if (!run_has_delim) {
+            continue;
+        }
+        // Whitespace between delimiters keeps the run open.
+        const std::string piece = common_token_to_piece(parent_ctx->ctx, tokens[i]);
+        if (!piece.empty() && piece.find_first_not_of(" \t\r\n") == std::string::npos) {
+            continue;
+        }
+        const llama_pos pos = (llama_pos) i;
+        if (pos - last_accepted >= min_gap) {
+            out.push_back(pos);
+            last_accepted = pos;
+        }
+        run_has_delim = false;
+    }
+    return out;
+}
+
+void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &media_paths, bool allow_state_cache) {
     bool has_media = !media_paths.empty();
+    // embedding()/rerank() drive throwaway prompts through this same path; keep their
+    // state out of the chat's checkpoint cache (see state_cache_capture_allowed).
+    state_cache_capture_allowed = allow_state_cache;
 
     // Check if this is an encoder-decoder model (like T5)
     const bool is_enc_dec = llama_model_has_encoder(parent_ctx->model);
@@ -97,6 +389,18 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
 
     if (!has_media) {
         std::vector<llama_token> text_tokens;
+
+        // Backbones with no text tokenizer (e.g. Chatterbox T3, tokenizer.ggml.model=none)
+        // must not call llama_tokenize — it asserts.  Leave embd empty; the TTS prefill
+        // block in nextToken() will take over from n_past = -1 (normalized to 0).
+        if (llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_NONE) {
+            embd.clear();
+            n_past = -1;
+            num_prompt_tokens = 0;
+            has_next_token = true;   // let the completion loop start
+            return;
+        }
+
         // Text-only path - use modified tokenization for encoder-decoder models
         text_tokens = ::common_tokenize(parent_ctx->ctx, parent_ctx->params.prompt, add_bos || is_enc_dec, true);
         num_prompt_tokens = text_tokens.size();
@@ -132,8 +436,19 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
         // / frequency_penalty, preventing EOS and producing
         // extremely verbose output on Qwen-family models.
 
-        // compare the evaluated prompt with the new prompt
-        n_past = is_enc_dec ? 0 : find_common_prefix_length(embd, text_tokens);
+        // n_common = shared prefix with the live cache; it bounds how far a
+        // checkpoint may be trusted.
+        size_t n_common = is_enc_dec ? 0 : find_common_prefix_length(embd, text_tokens);
+        // A mem-shared MTP draft leaves stale speculative cells in the target's
+        // SHARED KV window that upstream never cleans (TAG_KV_CACHE_SHARE_CELLS,
+        // see initMTP). Reusing any prefix — even the plain seq_rm fast path —
+        // then inherits that polluted state and shifts the distribution. Force a
+        // full reprocess for these drafts (the pre-reuse MTP behaviour); it is
+        // detected on the first generation turn, so this engages from turn 2 on.
+        if (mtp_draft_mem_shared) {
+            n_common = 0;
+        }
+        n_past = (llama_pos) n_common;
 
         embd = text_tokens;
         if (n_past == num_prompt_tokens) {
@@ -142,19 +457,76 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
         }
 
         // Manage KV cache
+        probeStateCache();
         auto * kv = llama_get_memory(parent_ctx->ctx);
+        if (mtp_draft_mem_shared) {
+            llama_memory_clear(kv, false);  // drop the polluted shared window
+        }
         bool cache_remove_success = llama_memory_seq_rm(kv, 0, n_past, -1);
 
-        // For hybrid models (LFM-2, Granite, Mamba, etc.), partial cache removal may fail
-        // In that case, do a full cache clear to prevent contamination
+        // Recurrent/hybrid/SWA: seq_rm fails beyond the rollback window; restore
+        // the longest matching snapshot and reprocess only the diverged tail.
         if (!cache_remove_success) {
-            LOG_WARNING("Partial cache removal failed (likely hybrid/recurrent model), doing full cache clear");
-            llama_memory_clear(kv, false);
-            embd.clear();
-            n_past = 0;
-            // Re-assign all tokens to embd since we cleared everything
-            embd = text_tokens;
+            if (recoverStateCheckpoint(text_tokens, n_common, num_prompt_tokens, n_past)) {
+                LOG_INFO("restored state checkpoint: reusing %d/%zu prompt tokens",
+                    n_past, num_prompt_tokens);
+            } else {
+                LOG_WARNING("no usable state checkpoint (recurrent/hybrid/SWA model), doing full cache clear");
+                llama_memory_clear(kv, false);
+                clearStateCheckpoints();
+                n_past = 0;
+            }
         }
+
+        // Frontier capture: the reused state already rests at n_past, so snapshot
+        // it here — one readback, no decode split. tokens[0,n_past) is the verified
+        // shared prefix, so it is token-exact. Restore point for a later
+        // regenerate/edit of this turn.
+        if (state_cache_enabled && state_cache_capture_allowed && n_past > 0) {
+            captureStateCheckpoint(text_tokens, (size_t) n_past);
+        }
+
+        // Cold ingest only lays boundary snapshots as it decodes (amortized once
+        // per session; seeds the system-prefix anchor). Warm turns don't split —
+        // the frontier capture above covers them, so the tail decodes in one batch.
+        const bool cold_ingest = n_past == 0;
+        boundary_ckpts.clear();
+        if (state_cache_enabled && state_cache_capture_allowed) {
+            if (cold_ingest) {
+                // Boundaries + the frontier (last boundary, even if min_gap would
+                // drop it) so a fresh session's first turn has a restore point.
+                // Delimiter-less templates find none — the prefill_interval
+                // fallback in nextToken covers long ones.
+                boundary_ckpts = computeMessageBoundaries(text_tokens, state_ckpt_min_gap);
+                const auto all = computeMessageBoundaries(text_tokens, /*min_gap*/ 1);
+                if (!all.empty() &&
+                    (boundary_ckpts.empty() || boundary_ckpts.back() != all.back())) {
+                    boundary_ckpts.push_back(all.back());
+                }
+            } else if (!cache_remove_success && (llama_pos) n_common > n_past &&
+                       (llama_pos) n_common < (llama_pos) num_prompt_tokens) {
+                // Restore path (seq_rm failed): capture the advanced frontier at
+                // n_common as we reprocess, so the checkpoint moves forward each
+                // turn (a rollback-0 model would otherwise freeze at its first
+                // snapshot). One split, only where seq_rm can't reuse in place.
+                boundary_ckpts.push_back((llama_pos) n_common);
+            }
+        }
+        // Eviction only keeps {first} + the newest few; don't serialize (or split
+        // prefill batches for) boundaries that can't survive this ingest.
+        if (boundary_ckpts.size() > state_cache_max_checkpoints) {
+            const size_t keep_tail = state_cache_max_checkpoints - 1;
+            std::vector<llama_pos> filtered;
+            filtered.reserve(state_cache_max_checkpoints);
+            filtered.push_back(boundary_ckpts.front());
+            filtered.insert(filtered.end(),
+                            boundary_ckpts.end() - keep_tail, boundary_ckpts.end());
+            boundary_ckpts = std::move(filtered);
+        }
+        // Cold stays pending even with no boundaries (interval fallback); warm
+        // only when we armed one.
+        prompt_checkpoint_pending = state_cache_enabled && state_cache_capture_allowed &&
+                                    (cold_ingest || !boundary_ckpts.empty());
 
         LOG_VERBOSE("prompt ingested, n_past: %d, cached: %s, to_eval: %s",
             n_past,
@@ -165,6 +537,11 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
         // Multimodal path - process all media paths
         processMedia(parent_ctx->params.prompt, media_paths);
         num_prompt_tokens = embd.size();
+        // Placeholder tokens are not vocab ids; no delimiter scan on media prompts.
+        boundary_ckpts.clear();
+        // Don't arm prompt-region snapshots: processMedia already ingested the
+        // whole prompt and captured via its callback; nothing left for nextToken.
+        prompt_checkpoint_pending = false;
     }
 
     // Handle encoder-decoder models (like T5) with special encoding phase
@@ -211,8 +588,8 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
 
     has_next_token = true;
 
-    LOG_INFO("[DEBUG] Input processed: n_past=%d, embd.size=%zu, num_prompt_tokens=%zu, has_media=%d",
-            n_past, embd.size(), num_prompt_tokens, has_media ? 1 : 0);
+    LOG_VERBOSE("loadPrompt: n_past=%d embd.size=%zu num_prompt_tokens=%zu has_media=%d",
+               n_past, (size_t)embd.size(), num_prompt_tokens, has_media ? 1 : 0);
 }
 
 void llama_rn_context_completion::beginCompletion() {
@@ -223,6 +600,7 @@ void llama_rn_context_completion::beginCompletion(int chat_format, common_reason
     // number of tokens to keep when resetting context
     n_remain = parent_ctx->params.n_predict;
     llama_perf_context_reset(parent_ctx->ctx);
+    resetGenerationTimings();
     is_predicting = true;
 
     current_chat_format = chat_format;
@@ -232,11 +610,344 @@ void llama_rn_context_completion::beginCompletion(int chat_format, common_reason
 }
 
 void llama_rn_context_completion::endCompletion() {
+    generated_text += utf8_gate.finish();
+    incomplete = false;
+    // Trim the undecoded final token. On a stop-word / token-budget stop the last
+    // sampled token is already pushed to embd but never decoded.
+    if (n_past > 0 && n_past < (llama_pos) embd.size()) {
+        embd.resize(n_past);
+    }
     is_predicting = false;
+}
+
+void llama_rn_context_completion::resetGenerationTimings() {
+    t_start_generation = 0;
+    t_token_generation = 0.0;
+}
+
+void llama_rn_context_completion::startGenerationTiming() {
+    if (t_start_generation == 0) {
+        t_start_generation = lm_ggml_time_us();
+    }
+}
+
+void llama_rn_context_completion::updateGenerationTiming() {
+    if (t_start_generation != 0 && num_tokens_predicted > 0) {
+        t_token_generation = (lm_ggml_time_us() - t_start_generation) / 1e6;
+    }
+}
+
+bool llama_rn_context_completion::shouldUseMTP() const {
+    const auto & types = parent_ctx->params.speculative.types;
+    return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end() &&
+        parent_ctx->params.speculative.draft.n_max > 0;
+}
+
+void llama_rn_context_completion::resetSpeculative() {
+    if (spec != nullptr) {
+        common_speculative_free(spec);
+        spec = nullptr;
+    }
+    spec_ctx.reset();
+    if (spec_batch_initialized) {
+        llama_batch_free(spec_batch);
+        spec_batch = {};
+        spec_batch_initialized = false;
+    }
+    spec_prompt.clear();
+    spec_id_last = LLAMA_TOKEN_NULL;
+    spec_n_past = 0;
+    spec_draft.clear();
+    spec_pending_tokens.clear();
+}
+
+void llama_rn_context_completion::initMTP() {
+    if (!shouldUseMTP()) {
+        return;
+    }
+    if (llama_model_has_encoder(parent_ctx->model)) {
+        throw std::runtime_error("MTP speculative decoding is only supported for decoder-only models");
+    }
+    if (embd.empty()) {
+        throw std::runtime_error("MTP speculative decoding requires a non-empty prompt");
+    }
+
+    const auto n_mtp = parent_ctx->params.speculative.draft.n_max;
+    if ((llama_model_is_recurrent(parent_ctx->model) || llama_model_is_hybrid(parent_ctx->model)) &&
+        llama_n_rs_seq(parent_ctx->ctx) < (uint32_t) n_mtp) {
+        throw std::runtime_error(
+            "MTP for recurrent or hybrid models must be enabled when loading the model "
+            "with speculative.type='draft-mtp' and speculative.n_max/spec_draft_n_max set");
+    }
+
+    resetSpeculative();
+
+    spec_ctx.reset(parent_ctx->createMTPDraftContext(parent_ctx->params));
+    if (spec_ctx == nullptr) {
+        throw std::runtime_error("failed to create MTP draft context");
+    }
+
+    parent_ctx->params.speculative.draft.ctx_tgt = parent_ctx->ctx;
+    parent_ctx->params.speculative.draft.ctx_dft = spec_ctx.get();
+
+    spec = common_speculative_init(parent_ctx->params.speculative, 1);
+    if (spec == nullptr) {
+        throw std::runtime_error("failed to initialize MTP speculative decoding");
+    }
+
+    spec_batch = llama_batch_init(llama_n_batch(parent_ctx->ctx), 0, 1);
+    spec_batch_initialized = true;
+
+    // A mem-shared draft (e.g. gemma4/EAGLE3) shares the target's KV cells, where
+    // upstream state save/restore is a no-op — restoring a checkpoint would leave
+    // stale speculative cells and corrupt the output. Disable the cache for it
+    // (full-reprocess each turn) until upstream supports shared-cell restore.
+    if (llama_get_ctx_other(spec_ctx.get()) == parent_ctx->ctx) {
+        if (state_cache_enabled) {
+            LOG_INFO("state cache disabled for this turn: mem-shared MTP draft "
+                     "(shared-cell state restore is unsupported upstream)");
+        }
+        mtp_draft_mem_shared = true;
+        state_cache_enabled = false;
+        clearStateCheckpoints();
+    }
+
+    evalMTPPrompt();
+    startGenerationTiming();
+}
+
+void llama_rn_context_completion::evalMTPPrompt() {
+    const llama_seq_id seq_id = 0;
+    const size_t n_prompt = embd.size();
+
+    spec_prompt.clear();
+    spec_pending_tokens.clear();
+    spec_draft.clear();
+    spec_id_last = embd.back();
+
+    if (n_prompt > 1) {
+        spec_prompt.assign(embd.begin(), embd.end() - 1);
+    }
+
+    const int32_t n_batch = std::max<int32_t>(1, llama_n_batch(parent_ctx->ctx));
+
+    // Reuse whatever prefix loadPrompt already left in the (shared) target
+    // memory: it set n_past to the reused position. Decode only the diverged tail.
+    size_t offset = std::min((size_t) std::max<llama_pos>(0, n_past), spec_prompt.size());
+    const size_t start_offset = offset;
+
+    while (offset < spec_prompt.size()) {
+        size_t decode_to = spec_prompt.size();
+        // Cold ingest only: stop at the next message boundary to snapshot there
+        // (boundary_ckpts is empty on warm turns, so the tail decodes whole).
+        {
+            const auto next_boundary = std::upper_bound(
+                boundary_ckpts.begin(), boundary_ckpts.end(), (llama_pos) offset);
+            if (next_boundary != boundary_ckpts.end() &&
+                (size_t) *next_boundary < spec_prompt.size()) {
+                decode_to = std::min(decode_to, (size_t) *next_boundary);
+            }
+        }
+
+        common_batch_clear(spec_batch);
+
+        const size_t n_eval = std::min<size_t>(n_batch, decode_to - offset);
+        for (size_t i = 0; i < n_eval; ++i) {
+            // MTP consumes pre-norm embeddings from every target row, but prompt logits are unused.
+            // Keep one output row per decode batch to preserve the usual llama.cpp graph shape.
+            const bool needs_logits = i + 1 == n_eval;
+            common_batch_add(spec_batch, spec_prompt[offset + i],
+                             (llama_pos) (offset + i), { seq_id }, needs_logits);
+        }
+
+        const int ret = llama_decode(parent_ctx->ctx, spec_batch);
+        if (ret != 0) {
+            // Memory holds only [0, offset); trim embd so a later prefix match
+            // can't claim never-decoded cells (mirrors nextToken).
+            embd.resize(std::min(embd.size(), offset));
+            n_past = (llama_pos) offset;
+            throw std::runtime_error("failed to evaluate MTP prompt batch, ret=" + std::to_string(ret));
+        }
+        if (!common_speculative_process(spec, spec_batch)) {
+            embd.resize(std::min(embd.size(), offset));
+            n_past = (llama_pos) offset;
+            throw std::runtime_error("failed to process MTP prompt batch");
+        }
+
+        offset += n_eval;
+
+        // Cold ingest only: snapshot at boundary positions the moment we reach
+        // them. Warm turns captured their frontier in loadPrompt already.
+        if (std::binary_search(boundary_ckpts.begin(), boundary_ckpts.end(),
+                               (llama_pos) offset)) {
+            captureStateCheckpoint(spec_prompt, offset);
+        }
+    }
+
+    mtp_prompt_reprocessed = spec_prompt.size() - start_offset;
+
+    spec_n_past = (llama_pos) spec_prompt.size();
+    n_past = spec_n_past;
+
+    common_speculative_begin(spec, seq_id, spec_prompt);
+}
+
+bool llama_rn_context_completion::refillMTPTokens() {
+    const llama_seq_id seq_id = 0;
+
+    if (spec_id_last == LLAMA_TOKEN_NULL || stopped_eos || stopped_limit || context_full) {
+        return false;
+    }
+    if (parent_ctx->params.n_predict >= 0 && n_remain == 0) {
+        stopped_limit = true;
+        has_next_token = false;
+        return false;
+    }
+
+    const int32_t n_ctx = parent_ctx->params.n_ctx;
+    if (spec_n_past + 1 >= n_ctx) {
+        context_full = true;
+        has_next_token = false;
+        return false;
+    }
+
+    spec_draft.clear();
+
+    const int32_t remaining =
+        parent_ctx->params.n_predict < 0 ? std::numeric_limits<int32_t>::max() : (int32_t) n_remain;
+    const int32_t n_draft_remaining = remaining == std::numeric_limits<int32_t>::max()
+        ? parent_ctx->params.speculative.draft.n_max
+        : std::max<int32_t>(0, remaining - 1);
+    const int32_t n_draft_ctx = std::max<int32_t>(0, n_ctx - (int32_t) spec_n_past - 1);
+    const int32_t n_draft_batch = std::max<int32_t>(0, llama_n_batch(parent_ctx->ctx) - 1);
+    const int32_t n_draft_limit = std::min<int32_t>(
+        parent_ctx->params.speculative.draft.n_max,
+        std::min<int32_t>(n_draft_remaining, std::min<int32_t>(n_draft_ctx, n_draft_batch)));
+
+    if (n_draft_limit > 0) {
+        common_speculative_get_draft_params(spec, seq_id) = {
+            /* .drafting = */ true,
+            /* .n_max    = */ n_draft_limit,
+            /* .n_past   = */ spec_n_past,
+            /* .id_last  = */ spec_id_last,
+            /* .prompt   = */ &spec_prompt,
+            /* .result   = */ &spec_draft,
+        };
+        common_speculative_draft(spec);
+
+        if ((int32_t) spec_draft.size() > n_draft_limit) {
+            spec_draft.resize(n_draft_limit);
+        }
+
+        common_memory memory;
+        memory.init(spec_ctx.get());
+        memory.seq_rm(seq_id, spec_n_past, -1);
+    }
+
+    const size_t n_draft = spec_draft.size();
+    num_draft_tokens += n_draft;
+
+    common_batch_clear(spec_batch);
+    common_batch_add(spec_batch, spec_id_last, spec_n_past, { seq_id }, true);
+    for (size_t i = 0; i < n_draft; ++i) {
+        common_batch_add(spec_batch, spec_draft[i],
+                         spec_n_past + (llama_pos) i + 1, { seq_id }, true);
+    }
+
+    const int ret = llama_decode(parent_ctx->ctx, spec_batch);
+    if (ret != 0) {
+        throw std::runtime_error("failed to evaluate MTP target batch, ret=" + std::to_string(ret));
+    }
+    if (!common_speculative_process(spec, spec_batch)) {
+        throw std::runtime_error("failed to process MTP target batch");
+    }
+
+    auto accepted = common_sampler_sample_and_accept_n(ctx_sampling, parent_ctx->ctx, spec_draft);
+    if (accepted.empty()) {
+        return false;
+    }
+
+    size_t accepted_count = accepted.size();
+    bool saw_eos = false;
+    const llama_vocab* vocab = llama_model_get_vocab(parent_ctx->model);
+    for (size_t i = 0; i < accepted.size(); ++i) {
+        if (llama_vocab_is_eog(vocab, accepted[i])) {
+            accepted_count = i + 1;
+            saw_eos = true;
+            break;
+        }
+
+        completion_token_output output;
+        output.tok = accepted[i];
+        output.text = common_token_to_piece(parent_ctx->ctx, accepted[i]);
+        spec_pending_tokens.push_back(std::move(output));
+    }
+
+    const size_t n_accepted_draft = saw_eos
+        ? accepted_count - 1
+        : accepted.size() - 1;
+    if (n_draft > 0) {
+        const size_t n_accepted = std::min(n_accepted_draft, n_draft);
+        num_draft_tokens_accepted += n_accepted;
+        common_speculative_accept(spec, seq_id, (uint16_t) n_accepted);
+    }
+
+    for (size_t i = 0; i < accepted_count; ++i) {
+        spec_prompt.push_back(spec_id_last);
+        spec_id_last = accepted[i];
+    }
+
+    spec_n_past += (llama_pos) accepted_count;
+    n_past = spec_n_past;
+
+    common_memory memory;
+    memory.init(parent_ctx->ctx, spec_ctx.get());
+    memory.seq_rm(seq_id, spec_n_past, -1);
+
+    if (saw_eos) {
+        stopped_eos = true;
+        has_next_token = false;
+    }
+
+    if (parent_ctx->params.n_predict >= 0) {
+        const size_t emitted = spec_pending_tokens.size();
+        n_remain = emitted >= n_remain ? 0 : n_remain - emitted;
+        if (n_remain == 0 && !saw_eos) {
+            stopped_limit = true;
+            has_next_token = false;
+        }
+    }
+
+    return !spec_pending_tokens.empty();
+}
+
+completion_token_output llama_rn_context_completion::nextTokenMTP() {
+    completion_token_output result;
+    result.tok = -1;
+
+    if (spec == nullptr) {
+        initMTP();
+    }
+    startGenerationTiming();
+
+    if (spec_pending_tokens.empty() && !refillMTPTokens()) {
+        return result;
+    }
+
+    result = std::move(spec_pending_tokens.front());
+    spec_pending_tokens.pop_front();
+    num_tokens_predicted++;
+    updateGenerationTiming();
+    has_next_token = !spec_pending_tokens.empty() || (!stopped_eos && !stopped_limit && !context_full);
+    return result;
 }
 
 completion_token_output llama_rn_context_completion::nextToken()
 {
+    if (shouldUseMTP()) {
+        return nextTokenMTP();
+    }
+
     completion_token_output result;
     result.tok = -1;
 
@@ -268,30 +979,559 @@ completion_token_output llama_rn_context_completion::nextToken()
         n_past -= n_discard;
         truncated = true;
 
+        // A context shift remaps positions; old snapshots no longer line up.
+        clearStateCheckpoints();
+
         LOG_VERBOSE("context shifted, new n_past: %d, new size: %d", n_past, embd.size());
     }
+
+    // Continuous-latent TTS flow (BlueMagpie-TTS / VoxCPM): after every
+    // `llama_decode` we hand the just-produced hidden state to
+    // `tryContinuousAudioStep` which runs the codec_lm's step machine
+    // (step_generate + step_feedback_embd) and produces the LocEnc
+    // feedback embedding for the NEXT decode.  Standard token sampling
+    // is skipped — the continuous codec_lm doesn't emit codebook codes.
+    // Terminates when the codec_lm's stop head fires.
+    const bool is_continuous_tts =
+        parent_ctx->isVocoderEnabled() &&
+        parent_ctx->tts_wrapper != nullptr &&
+        parent_ctx->tts_wrapper->isTTSContinuous(parent_ctx);
+
+    // Codebook codec_lm-AR TTS flow (CSM / Qwen3-TTS / MOSS-TTSD /
+    // MOSS-TTS-Realtime / Chatterbox): structurally identical to the
+    // continuous flow above but the codec_lm produces N codebook codes
+    // per step instead of a latent patch.  The hook appends codes to
+    // `tts_wrapper->audio_tokens` (T, N interleaved) and composes the
+    // next backbone embed via `codec_lm_compose_next_embd`.  Stop when
+    // the codec_lm's model-specific EOS heuristic trips.  Standard token
+    // sampling is bypassed: the backbone's own logits are consumed by
+    // the codec_lm hook (for text-modality c0 models like MOSS-TTS-Realtime)
+    // and discarded otherwise.
+    const bool is_codec_lm_ar_tts =
+        !is_continuous_tts &&
+        parent_ctx->isVocoderEnabled() &&
+        parent_ctx->tts_wrapper != nullptr &&
+        parent_ctx->tts_wrapper->isTTSCodecLmAR(parent_ctx);
+    LOG_VERBOSE("nextToken: is_continuous=%d is_codec_lm_ar=%d chatterbox_pending=%d",
+               (int)is_continuous_tts, (int)is_codec_lm_ar_tts,
+               parent_ctx->tts_wrapper ? (int)parent_ctx->tts_wrapper->chatterbox_prefill_pending : -1);
+
+    if ((is_continuous_tts || is_codec_lm_ar_tts) && !parent_ctx->params.embedding) {
+        LOG_ERROR("codec_lm TTS requires context created with embedding=true — please reinitialize the context");
+        has_next_token = false;
+        return result;
+    }
+
+    LOG_VERBOSE("nextToken: is_continuous=%d is_codec_lm_ar=%d talker_rows=%d embd.size=%zu n_past=%d",
+                (int)is_continuous_tts, (int)is_codec_lm_ar_tts,
+                parent_ctx->tts_wrapper ? parent_ctx->tts_wrapper->talker_prefix_rows : -1,
+                embd.size(), (int)n_past);
+
+    // vocab pointer needed in both the talker-prefix block and the
+    // post-while termination logic below.
+    const llama_vocab * vocab = llama_model_get_vocab(parent_ctx->model);
+
+    // Defense-in-depth against aborting the whole process on a NONE-vocab model.
+    // A backbone with tokenizer.ggml.model=none (e.g. Chatterbox T3 — the codec
+    // owns tokenization) has no text pieces: the normal sampling path below calls
+    // token_to_piece, which asserts on a NONE vocab (llama-vocab.cpp).  loadPrompt()
+    // deliberately starts the loop for such backbones so a TTS route can take over;
+    // if neither the continuous nor the codec_lm-AR TTS route claimed this step
+    // (e.g. no vocoder was attached, or codec_lm creation failed), stop gracefully
+    // instead of letting token_to_piece kill the app.
+    if (llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_NONE &&
+        !is_continuous_tts && !is_codec_lm_ar_tts) {
+        LOG_ERROR("nextToken: backbone has no text vocab (tokenizer.ggml.model=none) and no "
+                  "active TTS codec route — attach a vocoder (initVocoder) with a compatible "
+                  "codec GGUF for this model");
+        has_next_token = false;
+        return result;
+    }
+
+    // Speaker-conditioning prefix (voice-clone codec_lm-AR models).  Fed once
+    // via a manual embd-batch AHEAD of the token prompt so the codec_lm's
+    // first hidden read sees the speaker context.  The KV cache position
+    // shifts by `rows`; the token batch below starts from `n_past + rows`.
+    // Only fires on codec_lm-AR flows to keep the standard path unchanged.
+    //
+    // Source selection (in priority order):
+    //   1. Native registry (pending_speaker_id >= 0): auto-bake and inject
+    //      getSpeaker(id)->emb directly.  C++ owns the shape (n_embd is
+    //      authoritative); we validate hidden_dim against llama_model_n_embd.
+    //   2. Legacy path (pending_speaker_id < 0): pending_speaker_emb_prefix
+    //      as before — unchanged for back-compat.
+    if (parent_ctx->tts_wrapper != nullptr) {
+        const int speaker_id = parent_ctx->tts_wrapper->pending_speaker_id;
+        const float * emb_data   = nullptr;
+        int           emb_rows   = 0;
+        int           emb_hidden = 0;
+
+        if (is_codec_lm_ar_tts && speaker_id >= 0) {
+            const rn_speaker * spk =
+                parent_ctx->tts_wrapper->autoBakeSpeaker(parent_ctx, speaker_id);
+            const int model_n_embd = llama_model_n_embd(parent_ctx->model);
+            if (spk != nullptr && spk->rows > 0 &&
+                spk->hidden_dim == model_n_embd) {
+                emb_data   = spk->emb.data();
+                emb_rows   = spk->rows;
+                emb_hidden = spk->hidden_dim;
+            }
+        } else if (is_codec_lm_ar_tts &&
+                   !parent_ctx->tts_wrapper->pending_speaker_emb_prefix.empty() &&
+                   parent_ctx->tts_wrapper->pending_speaker_emb_rows > 0 &&
+                   parent_ctx->tts_wrapper->pending_speaker_emb_hidden_dim ==
+                       llama_model_n_embd(parent_ctx->model)) {
+            emb_data   = parent_ctx->tts_wrapper->pending_speaker_emb_prefix.data();
+            emb_rows   = parent_ctx->tts_wrapper->pending_speaker_emb_rows;
+            emb_hidden = parent_ctx->tts_wrapper->pending_speaker_emb_hidden_dim;
+        }
+
+        if (emb_data != nullptr && emb_rows > 0) {
+            llama_batch b = llama_batch_init(emb_rows, emb_hidden, 1);
+            b.n_tokens = emb_rows;
+            std::memcpy(b.embd, emb_data,
+                        (size_t) emb_rows * (size_t) emb_hidden * sizeof(float));
+            for (int i = 0; i < emb_rows; ++i) {
+                b.pos[i]       = n_past + i;
+                b.n_seq_id[i]  = 1;
+                b.seq_id[i][0] = 0;
+                b.logits[i]    = 0;
+            }
+            b.token = nullptr;
+            const int rc = llama_decode(parent_ctx->ctx, b);
+            llama_batch_free(b);
+            if (rc) {
+                LOG_ERROR("failed to eval speaker prefix, rows=%d", emb_rows);
+                has_next_token = false;
+                return result;
+            }
+            n_past += emb_rows;
+            // Consume the legacy fields so subsequent nextToken calls don't re-inject.
+            parent_ctx->tts_wrapper->pending_speaker_emb_prefix.clear();
+            parent_ctx->tts_wrapper->pending_speaker_emb_rows = 0;
+            parent_ctx->tts_wrapper->pending_speaker_emb_hidden_dim = 0;
+        }
+    }
+
+    // Qwen3-TTS talker prefix inject: `getFormattedAudioCompletion` built a
+    // multi-row embedding matrix (role tokens + text tokens + optional
+    // x-vector) via `audio_lm_build_talker_prefix`.  Decode it now as an
+    // embd batch with logits enabled only on the last row (which gives us the
+    // hidden state we pass to `tryCodecLmAudioStep`).  After the batch decode
+    // we arm embed-override mode via `tryTalkerPrefill` and immediately fire
+    // the first codec_lm step so that `pending_next_embd` is populated before
+    // the while loop.  We then grow `embd` to `rows` dummy slots so that
+    // n_past == embd.size() — the while loop is skipped, and the termination
+    // block below queues the placeholder and returns to the outer caller.
+    // Subsequent `nextToken` calls enter the normal inject_ar_embd → step path.
+    if (is_codec_lm_ar_tts &&
+        parent_ctx->tts_wrapper->talker_prefix_rows > 0 &&
+        (int) parent_ctx->tts_wrapper->talker_prefix_embd.size() ==
+            parent_ctx->tts_wrapper->talker_prefix_rows *
+            parent_ctx->tts_wrapper->talker_prefix_hidden) {
+
+        // loadPrompt sets n_past = -1 when embd is empty (its "must decode
+        // at least one token" guard).  For the talker path the KV cache is
+        // fresh and the prefix starts at position 0.
+        if (n_past < 0) n_past = 0;
+
+        const int rows       = parent_ctx->tts_wrapper->talker_prefix_rows;
+        const int hidden_dim = parent_ctx->tts_wrapper->talker_prefix_hidden;
+        llama_batch b = llama_batch_init(rows, hidden_dim, 1);
+        b.n_tokens = rows;
+        std::memcpy(b.embd,
+                    parent_ctx->tts_wrapper->talker_prefix_embd.data(),
+                    (size_t) rows * (size_t) hidden_dim * sizeof(float));
+        for (int i = 0; i < rows; ++i) {
+            b.pos[i]       = n_past + i;
+            b.n_seq_id[i]  = 1;
+            b.seq_id[i][0] = 0;
+            b.logits[i]    = (i == rows - 1) ? 1 : 0;
+        }
+        b.token = nullptr;
+        const int rc = llama_decode(parent_ctx->ctx, b);
+        llama_batch_free(b);
+        if (rc) {
+            LOG_ERROR("failed to eval talker prefix, rows=%d", rows);
+            has_next_token = false;
+            return result;
+        }
+        n_past += rows;
+        parent_ctx->tts_wrapper->talker_prefix_embd.clear();
+        parent_ctx->tts_wrapper->talker_prefix_rows   = 0;
+        parent_ctx->tts_wrapper->talker_prefix_hidden = 0;
+
+        // Arm embed-override so per-step audio_lm_get_next_embed works.
+        const float * last_h = llama_get_embeddings_ith(parent_ctx->ctx, -1);
+        const int dim = llama_model_n_embd(parent_ctx->model);
+        if (!last_h || dim <= 0) {
+            LOG_ERROR("talker prefix: llama_get_embeddings_ith returned NULL after %d rows", rows);
+            has_next_token = false;
+            return result;
+        }
+        if (!parent_ctx->tts_wrapper->tryTalkerPrefill(parent_ctx, last_h, dim)) {
+            LOG_ERROR("tryTalkerPrefill failed");
+            has_next_token = false;
+            return result;
+        }
+
+        // Fire the first codec_lm step using the prefix's last-row hidden.
+        if (!parent_ctx->tts_wrapper->tryCodecLmAudioStep(
+                parent_ctx, /*backbone_sampled_tok=*/-1, last_h, dim)) {
+            LOG_ERROR("tryCodecLmAudioStep failed after talker prefill");
+            has_next_token = false;
+            return result;
+        }
+
+        // Grow embd to match n_past so the while loop below is skipped
+        // (n_past == embd.size()) and subsequent calls drive the normal
+        // inject_ar_embd → step_now_codec_ar cycle at the right KV positions.
+        while ((llama_pos) embd.size() < n_past) {
+            embd.push_back(llama_vocab_bos(vocab));
+        }
+    }
+
+    // Chatterbox T3 prefill: when getFormattedAudioCompletion returned
+    // flow="chatterbox_embd", tokenize the text (via the baked BPE in the
+    // codec GGUF), build the CFG prompt embedding pair, and decode both
+    // cond + uncond sequences into the backbone KV cache (seq_ids 0 and 1).
+    // After prefill, fire the first codec_lm step and pad embd to match
+    // chatterbox_n_past so the inject_ar_embd cycle continues from there.
+    // Only runs once per generation: chatterbox_prefill_pending is cleared
+    // here and chatterbox_n_past > 0 on subsequent nextToken calls.
+    if (is_codec_lm_ar_tts &&
+        parent_ctx->tts_wrapper->chatterbox_prefill_pending) {
+
+        LOG_INFO("Chatterbox prefill: entering block, n_past=%d text='%s'",
+                 n_past,
+                 parent_ctx->tts_wrapper->chatterbox_text.substr(0,40).c_str());
+
+        parent_ctx->tts_wrapper->chatterbox_prefill_pending = false;
+
+        // Empty prompt → loadPrompt sets n_past = -1.  Normalize here.
+        if (n_past < 0) n_past = 0;
+
+        // Text is stored on tts_wrapper (backbone has no text tokenizer).
+        const std::string & text = parent_ctx->tts_wrapper->chatterbox_text;
+        const float cfg_weight   = parent_ctx->tts_wrapper->chatterbox_cfg_weight;
+
+        // When a registry speaker is active, forward its PCM as ref_pcm.
+        // (The baked emb is 34×1024 cond_enc output; codec_lm_chatterbox_build_prompt
+        // accepts only the 256-d pre-cond-enc intermediate or raw PCM — so we
+        // use the PCM path, which produces the same cond output.)
+        const float * ref_pcm       = nullptr;
+        int           ref_n_samples = 0;
+        int           ref_sr        = 0;
+        if (!parent_ctx->tts_wrapper->pending_chatterbox_ref_pcm.empty()) {
+            ref_pcm       = parent_ctx->tts_wrapper->pending_chatterbox_ref_pcm.data();
+            ref_n_samples = parent_ctx->tts_wrapper->pending_chatterbox_ref_n_samples;
+            ref_sr        = parent_ctx->tts_wrapper->pending_chatterbox_ref_sample_rate;
+        }
+
+        if (!parent_ctx->tts_wrapper->tryChatterboxPrefill(
+                parent_ctx, text,
+                ref_pcm, ref_n_samples, ref_sr, cfg_weight)) {
+            LOG_ERROR("tryChatterboxPrefill failed");
+            has_next_token = false;
+            return result;
+        }
+
+        n_past = parent_ctx->tts_wrapper->chatterbox_n_past;
+
+        const float * last_h = llama_get_embeddings_ith(parent_ctx->ctx, -1);
+        const int dim = llama_model_n_embd(parent_ctx->model);
+        if (!last_h || dim <= 0) {
+            LOG_ERROR("Chatterbox prefill: NULL hidden after decode");
+            has_next_token = false;
+            return result;
+        }
+        if (!parent_ctx->tts_wrapper->tryCodecLmAudioStep(
+                parent_ctx, /*backbone_sampled_tok=*/-1, last_h, dim)) {
+            LOG_ERROR("Chatterbox: first tryCodecLmAudioStep failed");
+            has_next_token = false;
+            return result;
+        }
+        while ((llama_pos) embd.size() < n_past) {
+            embd.push_back(llama_vocab_bos(vocab));
+        }
+    }
+
+    // MOSS-TTS-Realtime (streaming_interleave) prefill: when
+    // getFormattedAudioCompletion returned flow="realtime_embd", compose the
+    // streaming prefill block (context tokens + first prefill_text_len payload
+    // tokens, each row = text_embd[tok] + compose_audio_codes_embd), decode it
+    // as one embd batch, arm embed-override, then fire the first realtime step
+    // so pending_next_embd is ready.  Pad embd to match n_past so the
+    // inject_ar_embd cycle continues from there.  Runs once per generation.
+    if (is_codec_lm_ar_tts &&
+        parent_ctx->tts_wrapper->realtime_active &&
+        parent_ctx->tts_wrapper->realtime_prefill_pending) {
+
+        parent_ctx->tts_wrapper->realtime_prefill_pending = false;
+
+        // Empty prompt → loadPrompt sets n_past = -1.  Normalize here.
+        if (n_past < 0) n_past = 0;
+
+        const int new_past = parent_ctx->tts_wrapper->tryRealtimePrefill(
+            parent_ctx, (int) n_past);
+        if (new_past < 0) {
+            LOG_ERROR("tryRealtimePrefill failed");
+            has_next_token = false;
+            return result;
+        }
+        n_past = new_past;
+
+        const float * last_h = llama_get_embeddings_ith(parent_ctx->ctx, -1);
+        const int dim = llama_model_n_embd(parent_ctx->model);
+        if (!last_h || dim <= 0) {
+            LOG_ERROR("realtime prefill: NULL hidden after decode");
+            has_next_token = false;
+            return result;
+        }
+        if (!parent_ctx->tts_wrapper->tryCodecLmAudioStep(
+                parent_ctx, /*backbone_sampled_tok=*/-1, last_h, dim)) {
+            LOG_ERROR("realtime: first tryCodecLmAudioStep failed");
+            has_next_token = false;
+            return result;
+        }
+        while ((llama_pos) embd.size() < n_past) {
+            embd.push_back(llama_vocab_bos(vocab));
+        }
+    }
+    // Interval fallback (0 = off): only for cold prompts with no message
+    // boundaries (prompt_checkpoint_pending is cold-ingest-only, see loadPrompt).
+    const llama_pos prefill_interval =
+        (state_cache_enabled && prompt_checkpoint_pending && boundary_ckpts.empty())
+            ? (llama_pos) state_ckpt_prefill_interval
+            : 0;
 
     bool tg = true;
     while (n_past < embd.size())
     {
-        int n_eval = (int)embd.size() - n_past;
-        tg = n_eval == 1;
+        llama_pos decode_to = (llama_pos) embd.size();
+        // Cold ingest only: split the decode at snapshot positions so we can
+        // capture there (boundary / interval). Warm turns leave boundary_ckpts
+        // empty and prompt_checkpoint_pending false, so the tail decodes whole.
+        if (prompt_checkpoint_pending) {
+            const auto next_boundary = std::upper_bound(
+                boundary_ckpts.begin(), boundary_ckpts.end(), n_past);
+            if (next_boundary != boundary_ckpts.end()) {
+                decode_to = std::min(decode_to, *next_boundary);
+            }
+        }
+        if (prefill_interval > 0) {
+            const llama_pos next_ckpt = (n_past / prefill_interval + 1) * prefill_interval;
+            if (next_ckpt < (llama_pos) num_prompt_tokens) {
+                decode_to = std::min(decode_to, next_ckpt);
+            }
+        }
+        int n_eval = (int)(decode_to - n_past);
+        tg = ((int) embd.size() - n_past) == 1;
         if (n_eval > parent_ctx->params.n_batch)
         {
             n_eval = parent_ctx->params.n_batch;
         }
-        if (llama_decode(parent_ctx->ctx, llama_batch_get_one(&embd[n_past], n_eval)))
-        {
-            LOG_ERROR("failed to eval, n_eval: %d, n_past: %d, n_threads: %d, embd: %s",
-                n_eval,
-                n_past,
-                parent_ctx->params.cpuparams.n_threads,
-                tokens_to_str(parent_ctx->ctx, embd.cbegin() + n_past, embd.cend()).c_str()
-            );
-            has_next_token = false;
-            return result;
+        // Standard path: token batch via llama_batch_get_one.  Continuous-
+        // latent TTS injects the LocEnc feedback embedding via `b.embd`
+        // (see below); we detect that by a pending flag on tts_wrapper.
+        // Codec_lm-AR TTS does the same with the composed audio embedding
+        // (`pending_next_embd`) so the codec_lm's compose_next_embd output
+        // becomes the next `llama_decode`'s input.
+        const bool inject_embd =
+            is_continuous_tts &&
+            n_eval == 1 &&
+            parent_ctx->tts_wrapper->audio_embeddings_pending &&
+            (int) parent_ctx->tts_wrapper->pending_feedback_embd.size() ==
+                llama_model_n_embd(parent_ctx->model);
+        const bool inject_ar_embd =
+            is_codec_lm_ar_tts &&
+            n_eval == 1 &&
+            parent_ctx->tts_wrapper->codec_lm_ar_pending_embd &&
+            (int) parent_ctx->tts_wrapper->pending_next_embd.size() ==
+                llama_model_n_embd(parent_ctx->model);
+
+        if (inject_embd || inject_ar_embd) {
+            const int hidden_dim = llama_model_n_embd(parent_ctx->model);
+            const float * src = inject_embd
+                ? parent_ctx->tts_wrapper->pending_feedback_embd.data()
+                : parent_ctx->tts_wrapper->pending_next_embd.data();
+            llama_batch b = llama_batch_init(1, hidden_dim, 1);
+            b.n_tokens = 1;
+            std::memcpy(b.embd, src, (size_t) hidden_dim * sizeof(float));
+            b.pos[0]       = n_past;
+            b.n_seq_id[0]  = 1;
+            b.seq_id[0][0] = 0;
+            b.logits[0]    = 1;
+            b.token        = nullptr;
+            const int rc = llama_decode(parent_ctx->ctx, b);
+            llama_batch_free(b);
+            if (rc) {
+                LOG_ERROR("failed to eval codec_lm TTS embd, n_past: %d", n_past);
+                embd.resize(n_past);
+                has_next_token = false;
+                return result;
+            }
+            // Consume the pending embd so subsequent iterations don't
+            // re-inject; the codec_lm step below re-populates it.
+            if (inject_embd) {
+                parent_ctx->tts_wrapper->audio_embeddings_pending = false;
+                parent_ctx->tts_wrapper->pending_feedback_embd.clear();
+            } else {
+                parent_ctx->tts_wrapper->codec_lm_ar_pending_embd = false;
+                parent_ctx->tts_wrapper->pending_next_embd.clear();
+            }
+        } else if (is_continuous_tts) {
+            // Continuous-latent TTS prompt decode: the RALM must see the
+            // WHOLE prompt's per-position backbone hiddens before generation
+            // (codec_lm_text_prefill).  llama_batch_get_one only requests
+            // logits/embeddings on the LAST position, so build a manual token
+            // batch with logits[i]=1 for every token in the chunk and gather
+            // each position's hidden into tts_wrapper->prompt_hiddens (in
+            // order, across n_batch chunks).  tryContinuousPrefill fires once
+            // the full prompt is decoded (below).
+            llama_batch b = llama_batch_init(n_eval, 0, 1);
+            b.n_tokens = n_eval;
+            for (int i = 0; i < n_eval; ++i) {
+                b.token[i]     = embd[n_past + i];
+                b.pos[i]       = n_past + i;
+                b.n_seq_id[i]  = 1;
+                b.seq_id[i][0] = 0;
+                b.logits[i]    = 1;
+            }
+            const int rc = llama_decode(parent_ctx->ctx, b);
+            if (rc) {
+                llama_batch_free(b);
+                LOG_ERROR("failed to eval continuous TTS prompt, n_eval: %d, n_past: %d",
+                          n_eval, (int) n_past);
+                embd.resize(n_past);
+                has_next_token = false;
+                return result;
+            }
+            const int dim = llama_model_n_embd(parent_ctx->model);
+            for (int i = 0; i < n_eval; ++i) {
+                const float * h = llama_get_embeddings_ith(parent_ctx->ctx, i);
+                if (h == nullptr || dim <= 0) {
+                    llama_batch_free(b);
+                    LOG_ERROR("continuous TTS: NULL hidden for prompt pos %d (n_past=%d)",
+                              i, (int) n_past);
+                    has_next_token = false;
+                    return result;
+                }
+                parent_ctx->tts_wrapper->prompt_hiddens.insert(
+                    parent_ctx->tts_wrapper->prompt_hiddens.end(), h, h + dim);
+            }
+            llama_batch_free(b);
+        } else {
+            if (llama_decode(parent_ctx->ctx, llama_batch_get_one(&embd[n_past], n_eval)))
+            {
+                LOG_ERROR("failed to eval, n_eval: %d, n_past: %d, n_threads: %d, embd: %s",
+                    n_eval,
+                    n_past,
+                    parent_ctx->params.cpuparams.n_threads,
+                    tokens_to_str(parent_ctx->ctx, embd.cbegin() + n_past, embd.cend()).c_str()
+                );
+                // Trim embd to what the memory actually contains so a later prefix
+                // match can't claim never-written cells.
+                embd.resize(n_past);
+                has_next_token = false;
+                return result;
+            }
         }
         n_past += n_eval;
+
+        // For continuous / codec_lm-AR TTS: run one codec_lm step once
+        // we've fully decoded the current pending sequence (prompt or
+        // feedback embd).  The last decoded position's hidden state
+        // seeds the next step; unlike standard capture we do NOT gate
+        // on tg (multi-token prompt batches also produce a valid
+        // last-position hidden via llama_get_embeddings_ith(-1)).
+        const bool step_now_continuous =
+            is_continuous_tts &&
+            (llama_pos) n_past == (llama_pos) embd.size();
+        const bool step_now_codec_ar =
+            is_codec_lm_ar_tts &&
+            (llama_pos) n_past == (llama_pos) embd.size();
+
+        if (step_now_continuous) {
+            const float *embedding = llama_get_embeddings_ith(parent_ctx->ctx, -1);
+            const int dim = llama_model_n_embd(parent_ctx->model);
+            if (embedding == nullptr || dim <= 0) {
+                LOG_ERROR("continuous TTS: llama_get_embeddings_ith returned NULL at n_past=%d", (int) n_past);
+                has_next_token = false;
+                return result;
+            }
+            // Before the FIRST step, run the RALM text-prefill so it has
+            // seen the whole prompt's per-position hiddens (call sequence:
+            // prefill(all positions) → step (primed, patch 0, ignores h_in)
+            // → feedback embd → decode → step → ...).  Guarded to run once
+            // per generation; `reset()` clears the flag + the RALM state.
+            if (!parent_ctx->tts_wrapper->continuous_prefill_done) {
+                const int n_prompt =
+                    (int) (parent_ctx->tts_wrapper->prompt_hiddens.size() / (size_t) dim);
+                if (n_prompt <= 0) {
+                    LOG_ERROR("continuous TTS: no prompt hiddens gathered for prefill (n_past=%d)",
+                              (int) n_past);
+                    has_next_token = false;
+                    return result;
+                }
+                if (!parent_ctx->tts_wrapper->tryContinuousPrefill(
+                        parent_ctx,
+                        parent_ctx->tts_wrapper->prompt_hiddens.data(),
+                        n_prompt, dim)) {
+                    LOG_ERROR("tryContinuousPrefill failed at n_past=%d", (int) n_past);
+                    has_next_token = false;
+                    return result;
+                }
+                parent_ctx->tts_wrapper->continuous_prefill_done = true;
+                // Free the scratch — the K/V is now in the RALM cache.
+                parent_ctx->tts_wrapper->prompt_hiddens.clear();
+                parent_ctx->tts_wrapper->prompt_hiddens.shrink_to_fit();
+            }
+            // Run one codec_lm step on the just-produced hidden state,
+            // accumulating the latent patch into
+            // tts_wrapper->audio_embeddings and preparing the next
+            // b.embd via pending_feedback_embd.  Sets
+            // audio_embeddings_done when the stop head fires.
+            if (!parent_ctx->tts_wrapper->tryContinuousAudioStep(
+                    parent_ctx, embedding, dim)) {
+                LOG_ERROR("tryContinuousAudioStep failed at n_past=%d", (int) n_past);
+                has_next_token = false;
+                return result;
+            }
+            embedding_dim = parent_ctx->tts_wrapper->audio_embedding_dim;
+            // Surface the accumulated latents through the standard
+            // `embeddings` field so JS's `result.embeddings` +
+            // `result.embedding_dim` are populated consistently.
+            embeddings = parent_ctx->tts_wrapper->audio_embeddings;
+        } else if (step_now_codec_ar) {
+            const float *embedding = llama_get_embeddings_ith(parent_ctx->ctx, -1);
+            const int dim = llama_model_n_embd(parent_ctx->model);
+            if (embedding == nullptr || dim <= 0) {
+                LOG_ERROR("codec_lm-AR TTS: llama_get_embeddings_ith returned NULL at n_past=%d", (int) n_past);
+                has_next_token = false;
+                return result;
+            }
+            // Run one codec_lm step: samples N codebook codes, appends
+            // them to tts_wrapper->audio_tokens (T, N interleaved), and
+            // composes the next backbone embed into pending_next_embd.
+            // The backbone-sampled token is unused for text-modality-c0
+            // models here (-1); tryCodecLmAudioStep pulls it from
+            // llama_get_logits_ith internally when needed.
+            if (!parent_ctx->tts_wrapper->tryCodecLmAudioStep(
+                    parent_ctx, /*backbone_sampled_tok=*/-1,
+                    embedding, dim)) {
+                LOG_ERROR("tryCodecLmAudioStep failed at n_past=%d", (int) n_past);
+                has_next_token = false;
+                return result;
+            }
+        } else if (parent_ctx->params.embedding && tg && n_past > (llama_pos)num_prompt_tokens) {
+            const float *embedding = llama_get_embeddings_ith(parent_ctx->ctx, -1);
+            const int dim = llama_model_n_embd(parent_ctx->model);
+            if (embedding != nullptr && dim > 0) {
+                embedding_dim = dim;
+                embeddings.insert(embeddings.end(), embedding, embedding + dim);
+            }
+        }
 
         if(is_interrupted) {
             LOG_INFO("Decoding Interrupted");
@@ -299,9 +1539,27 @@ completion_token_output llama_rn_context_completion::nextToken()
             has_next_token = false;
             return result;
         }
+
+        // Cold ingest only: snapshot at boundary / interval positions as we
+        // reach them. Warm turns captured their frontier in loadPrompt already.
+        if (prompt_checkpoint_pending &&
+            std::binary_search(boundary_ckpts.begin(), boundary_ckpts.end(), n_past)) {
+            captureStateCheckpoint();
+        }
+        else if (prefill_interval > 0 && n_past < (llama_pos) num_prompt_tokens &&
+                 n_past % prefill_interval == 0) {
+            captureStateCheckpoint();
+        }
     }
 
-    const llama_vocab* vocab = llama_model_get_vocab(parent_ctx->model);
+    // Prompt end not captured: the next turn's frontier capture covers it.
+    if (prompt_checkpoint_pending && n_past >= (llama_pos) num_prompt_tokens) {
+        prompt_checkpoint_pending = false;
+    }
+
+    // No snapshots during generation: a stable append reuses the reply via
+    // seq_rm; otherwise the next ingest reprocesses it once and lays a boundary
+    // snapshot after it.
 
     if (parent_ctx->params.n_predict == 0)
     {
@@ -309,6 +1567,65 @@ completion_token_output llama_rn_context_completion::nextToken()
         result.tok = llama_vocab_eos(vocab);
         return result;
     }
+
+    // Continuous-latent TTS: skip token sampling entirely.  If the stop
+    // head fired during the step hook, terminate.  Otherwise queue the
+    // pending feedback embd — the NEXT `nextToken` will consume it via
+    // the inject-embd path above.  We grow `embd` by one dummy slot so
+    // the outer loop's `n_past < embd.size()` becomes true again next
+    // time, driving another decode.
+    if (is_continuous_tts) {
+        if (parent_ctx->tts_wrapper->audio_embeddings_done) {
+            has_next_token = false;
+            stopped_eos = true;
+            return result;
+        }
+        if (!parent_ctx->tts_wrapper->audio_embeddings_pending) {
+            // No pending feedback and no stop — shouldn't happen unless
+            // the codec step returned neither result.  Guard against a
+            // spin loop by bailing.
+            LOG_ERROR("continuous TTS: no feedback embd queued after step; stopping");
+            has_next_token = false;
+            return result;
+        }
+        // Placeholder token — never consumed since we replace the next
+        // decode with our embd batch via `inject_embd`.  Using BOS keeps
+        // any downstream vocab lookups sane if the caller ever peeks at
+        // `embd` (currently: no one does for continuous flow).
+        embd.push_back(llama_vocab_bos(vocab));
+        result.tok = -1;
+        --n_remain;
+        num_tokens_predicted++;
+        has_next_token = parent_ctx->params.n_predict == -1 || n_remain != 0;
+        return result;
+    }
+
+    // Codebook codec_lm-AR TTS: same skip-sampling shape as continuous.
+    // The codec_lm hook already appended this frame's N codes to
+    // `tts_wrapper->audio_tokens` and set up `pending_next_embd` for
+    // the next decode.  On CSM's audio-EOS heuristic (or any future
+    // per-model stop condition wired into `tryCodecLmAudioStep`),
+    // terminate here so the outer completion loop stops.
+    if (is_codec_lm_ar_tts) {
+        if (parent_ctx->tts_wrapper->codec_lm_ar_done) {
+            has_next_token = false;
+            stopped_eos = true;
+            return result;
+        }
+        if (!parent_ctx->tts_wrapper->codec_lm_ar_pending_embd) {
+            LOG_ERROR("codec_lm-AR TTS: no next embd queued after step; stopping");
+            has_next_token = false;
+            return result;
+        }
+        embd.push_back(llama_vocab_bos(vocab));
+        result.tok = -1;
+        --n_remain;
+        num_tokens_predicted++;
+        has_next_token = parent_ctx->params.n_predict == -1 || n_remain != 0;
+        return result;
+    }
+
+    startGenerationTiming();
 
     {
         // out of user input, sample next token
@@ -333,19 +1650,13 @@ completion_token_output llama_rn_context_completion::nextToken()
             return result;
         }
 
-        if (parent_ctx->tts_wrapper != nullptr && parent_ctx->tts_wrapper->next_token_uses_guide_token && !parent_ctx->tts_wrapper->guide_tokens.empty() && !llama_vocab_is_control(vocab, new_token_id)) {
-            new_token_id = parent_ctx->tts_wrapper->guide_tokens[0];
-            parent_ctx->tts_wrapper->guide_tokens.erase(parent_ctx->tts_wrapper->guide_tokens.begin());
-        }
-        if (parent_ctx->tts_wrapper != nullptr) {
-            parent_ctx->tts_wrapper->next_token_uses_guide_token = (new_token_id == 198);
-        }
         result.tok = new_token_id;
         result.text = common_token_to_piece(parent_ctx->ctx, new_token_id);
 
         common_sampler_accept(ctx_sampling, result.tok, true);
         if (tg) {
             num_tokens_predicted++;
+            updateGenerationTiming();
         }
     }
 
@@ -395,16 +1706,14 @@ completion_token_output llama_rn_context_completion::doCompletion()
     completion_token_output token_with_probs = nextToken();
 
     const std::string token_text = token_with_probs.tok == -1 ? "" : common_token_to_piece(parent_ctx->ctx, token_with_probs.tok);
-    generated_text += token_text;
+    generated_text += utf8_gate.feed(token_text);
 
     if (parent_ctx->isVocoderEnabled()) {
         tts_type type = parent_ctx->tts_wrapper->getTTSType(parent_ctx);
         if (parent_ctx->tts_wrapper->type == UNKNOWN) {
             parent_ctx->tts_wrapper->type = type;
         }
-        if ((type == OUTETTS_V0_2 || type == OUTETTS_V0_3) && (token_with_probs.tok >= 151672 && token_with_probs.tok <= 155772)) {
-            parent_ctx->tts_wrapper->audio_tokens.push_back(token_with_probs.tok);
-        }
+        parent_ctx->tts_wrapper->tryAddAudioToken(parent_ctx, token_with_probs.tok, token_text);
     }
 
     if (parent_ctx->params.sampling.n_probs > 0)
@@ -412,26 +1721,7 @@ completion_token_output llama_rn_context_completion::doCompletion()
         generated_token_probs.push_back(token_with_probs);
     }
 
-    // check if there is incomplete UTF-8 character at the end
-    for (unsigned i = 1; i < 5 && i <= generated_text.size(); ++i) {
-        unsigned char c = generated_text[generated_text.size() - i];
-        if ((c & 0xC0) == 0x80) {
-            // continuation byte: 10xxxxxx
-            continue;
-        }
-        if ((c & 0xE0) == 0xC0) {
-            // 2-byte character: 110xxxxx ...
-            incomplete = i < 2;
-        } else if ((c & 0xF0) == 0xE0) {
-            // 3-byte character: 1110xxxx ...
-            incomplete = i < 3;
-        } else if ((c & 0xF8) == 0xF0) {
-            // 4-byte character: 11110xxx ...
-            incomplete = i < 4;
-        }
-        // else 1-byte character or invalid byte
-        break;
-    }
+    incomplete = utf8_gate.has_pending();
 
     if (incomplete && !has_next_token)
     {
@@ -487,12 +1777,13 @@ std::vector<float> llama_rn_context_completion::embedding(common_params &embd_pa
     llama_memory_clear(llama_get_memory(parent_ctx->ctx), true);
 
     rewind();
+    embd.clear();
     llama_perf_context_reset(parent_ctx->ctx);
     if (!initSampling()) {
         throw std::runtime_error("Failed to initialize sampling");
     }
     beginCompletion();
-    loadPrompt({});
+    loadPrompt({}, /*allow_state_cache*/ false);
     doCompletion();
     endCompletion();
 
@@ -554,7 +1845,7 @@ std::vector<float> llama_rn_context_completion::rerank(const std::string &query,
         try {
             parent_ctx->params.prompt = tokens_to_str(parent_ctx->ctx, rerank_tokens.begin(), rerank_tokens.end());
             initSampling();
-            loadPrompt({}); // No media paths for rerank
+            loadPrompt({}, /*allow_state_cache*/ false); // No media paths for rerank
             beginCompletion();
             doCompletion();
 
@@ -803,6 +2094,19 @@ void llama_rn_context_completion::processMedia(
 
     // Delegate to the mtmd_wrapper method
     // For non-parallel mode, use the global bitmap_past_hashes from mtmd_wrapper
+    probeStateCache();
+    // Wire the state cache into the media path so images aren't re-encoded
+    // every turn.
+    auto recover = [this](const std::vector<llama_token> &target, size_t max_reuse,
+                          size_t total_tokens, llama_pos &n_past_out) {
+        return recoverStateCheckpoint(target, max_reuse, total_tokens, n_past_out);
+    };
+    auto capture = [this](const std::vector<llama_token> &seq, size_t n) {
+        captureStateCheckpoint(seq, n);
+    };
+    auto invalidate = [this](size_t n) {
+        eraseStateCheckpointsAfter(n);
+    };
     parent_ctx->mtmd_wrapper->processMedia(
         parent_ctx->ctx,
         prompt,
@@ -814,7 +2118,10 @@ void llama_rn_context_completion::processMedia(
         context_full,
         ctx_sampling,
         parent_ctx->mtmd_wrapper->bitmap_past_hashes,
-        0  // Use sequence ID 0 for non-parallel mode
+        0,  // Use sequence ID 0 for non-parallel mode
+        recover,
+        capture,
+        invalidate
     );
 }
 

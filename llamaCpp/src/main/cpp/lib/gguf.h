@@ -76,10 +76,16 @@ extern "C" {
         struct lm_ggml_context ** ctx;
     };
 
+    // callback to simulate or wrap a FILE pointer - read up to `len` bytes at `offset` into `output` and return the number of bytes read
+    typedef size_t (*lm_gguf_reader_callback_t)(void * userdata, void * output, uint64_t offset, size_t len);
+
     LM_GGML_API struct lm_gguf_context * lm_gguf_init_empty(void);
     LM_GGML_API struct lm_gguf_context * lm_gguf_init_from_file_ptr(FILE * file, struct lm_gguf_init_params params);
     LM_GGML_API struct lm_gguf_context * lm_gguf_init_from_file(const char * fname, struct lm_gguf_init_params params);
-    //LM_GGML_API struct lm_gguf_context * lm_gguf_init_from_buffer(..);
+    LM_GGML_API struct lm_gguf_context * lm_gguf_init_from_buffer(const void * data, size_t size, struct lm_gguf_init_params params);
+
+    // max_chunk_read is the maximum number of bytes that the GGUF code will read at once from the callback, a value of 0 means no limit
+    LM_GGML_API struct lm_gguf_context * lm_gguf_init_from_callback(lm_gguf_reader_callback_t callback, void * userdata, size_t max_chunk_read, uint64_t max_expected_size, struct lm_gguf_init_params params);
 
     LM_GGML_API void lm_gguf_free(struct lm_gguf_context * ctx);
 
@@ -87,7 +93,7 @@ extern "C" {
 
     LM_GGML_API uint32_t lm_gguf_get_version    (const struct lm_gguf_context * ctx);
     LM_GGML_API size_t   lm_gguf_get_alignment  (const struct lm_gguf_context * ctx);
-    LM_GGML_API size_t   lm_gguf_get_data_offset(const struct lm_gguf_context * ctx);
+    LM_GGML_API size_t   lm_gguf_get_data_offset(const struct lm_gguf_context * ctx);  // padded to lm_gguf_get_alignment if and only if the lm_gguf_context contains at least one tensor
 
     LM_GGML_API int64_t      lm_gguf_get_n_kv(const struct lm_gguf_context * ctx);
     LM_GGML_API int64_t      lm_gguf_find_key(const struct lm_gguf_context * ctx, const char * key); // returns -1 if key is not found
@@ -119,12 +125,13 @@ extern "C" {
     // get ith C string from array with given key_id
     LM_GGML_API const char * lm_gguf_get_arr_str (const struct lm_gguf_context * ctx, int64_t key_id, size_t i);
 
-    LM_GGML_API int64_t        lm_gguf_get_n_tensors    (const struct lm_gguf_context * ctx);
-    LM_GGML_API int64_t        lm_gguf_find_tensor      (const struct lm_gguf_context * ctx, const char * name); // returns -1 if the tensor is not found
-    LM_GGML_API size_t         lm_gguf_get_tensor_offset(const struct lm_gguf_context * ctx, int64_t tensor_id);
-    LM_GGML_API const char *   lm_gguf_get_tensor_name  (const struct lm_gguf_context * ctx, int64_t tensor_id);
-    LM_GGML_API enum lm_ggml_type lm_gguf_get_tensor_type  (const struct lm_gguf_context * ctx, int64_t tensor_id);
-    LM_GGML_API size_t         lm_gguf_get_tensor_size  (const struct lm_gguf_context * ctx, int64_t tensor_id);
+    LM_GGML_API int64_t         lm_gguf_get_n_tensors    (const struct lm_gguf_context * ctx);
+    LM_GGML_API int64_t         lm_gguf_find_tensor      (const struct lm_gguf_context * ctx, const char * name); // returns -1 if the tensor is not found
+    LM_GGML_API size_t          lm_gguf_get_tensor_offset(const struct lm_gguf_context * ctx, int64_t tensor_id);
+    LM_GGML_API const char *    lm_gguf_get_tensor_name  (const struct lm_gguf_context * ctx, int64_t tensor_id);
+    LM_GGML_API const int64_t * lm_gguf_get_tensor_ne    (const struct lm_gguf_context * ctx, int64_t tensor_id); // returns ne, an array of LM_GGML_MAX_DIMS elements; ne[dim] is 1 for dim >= n_dims
+    LM_GGML_API enum lm_ggml_type  lm_gguf_get_tensor_type  (const struct lm_gguf_context * ctx, int64_t tensor_id);
+    LM_GGML_API size_t          lm_gguf_get_tensor_size  (const struct lm_gguf_context * ctx, int64_t tensor_id);
 
     // removes key if it exists, returns id that the key had prior to removal (-1 if it didn't exist)
     LM_GGML_API int64_t lm_gguf_remove_key(struct lm_gguf_context * ctx, const char * key);
