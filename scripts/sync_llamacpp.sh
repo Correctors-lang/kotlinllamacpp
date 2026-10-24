@@ -36,6 +36,16 @@ cp -r "$TEMP_DIR"/cpp/ggml-cpu/* "$TARGET_DIR/ggml-cpu/"
 mkdir -p "$TARGET_DIR/nlohmann"
 cp -r "$TEMP_DIR"/cpp/nlohmann/* "$TARGET_DIR/nlohmann/"
 
+# Le backend OpenCL (GPU Adreno) et le codec audio : le script les oubliait,
+# alors qu'il commence par VIDER le dossier cible — une synchronisation les
+# aurait donc supprimés, et avec eux le backend que ce fork existe pour
+# fournir (2026-10-24).
+mkdir -p "$TARGET_DIR/ggml-opencl"
+cp -r "$TEMP_DIR"/cpp/ggml-opencl/* "$TARGET_DIR/ggml-opencl/"
+
+mkdir -p "$TARGET_DIR/codec"
+cp -r "$TEMP_DIR"/cpp/codec/* "$TARGET_DIR/codec/"
+
 # If there are models directory (sometimes used for templates)
 if [ -d "$TEMP_DIR/cpp/models" ]; then
     cp -r "$TEMP_DIR"/cpp/models "$TARGET_DIR/"
