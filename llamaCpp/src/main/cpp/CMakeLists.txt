@@ -28,6 +28,9 @@ include_directories(
     # inclut `codec.h`, d'où l'échec de compilation sans ces chemins.
     ${RNLLAMA_LIB_DIR}/codec/include
     ${RNLLAMA_LIB_DIR}/codec/common
+    # `vendor/hash` : sha256.c inclut « rotate-bits/rotate-bits.h » par un
+    # chemin relatif à la racine du dossier hash.
+    ${RNLLAMA_LIB_DIR}/tools/mtmd/hash
 )
 
 # Sources de `codec`, reprises du CMake de production de cui-llama.rn.
@@ -49,15 +52,25 @@ list(REMOVE_ITEM CODEC_FILES
 )
 
 # Collect source files using glob patterns
-file(GLOB MODEL_FILES ${RNLLAMA_LIB_DIR}/models/*.cpp)
-file(GLOB GGML_CPU_C_FILES ${RNLLAMA_LIB_DIR}/ggml-cpu/*.c)
-file(GLOB GGML_CPU_CPP_FILES ${RNLLAMA_LIB_DIR}/ggml-cpu/*.cpp)
-file(GLOB GGML_CPU_AMX_FILES ${RNLLAMA_LIB_DIR}/ggml-cpu/amx/*.cpp)
-file(GLOB LLAMA_FILES ${RNLLAMA_LIB_DIR}/llama*.cpp)
-file(GLOB MTMD_FILES ${RNLLAMA_LIB_DIR}/tools/mtmd/*.cpp)
-file(GLOB MTMD_MODEL_FILES ${RNLLAMA_LIB_DIR}/tools/mtmd/models/*.cpp)
-file(GLOB COMMON_FILES ${RNLLAMA_LIB_DIR}/common/*.cpp)
-file(GLOB JINJA_FILES ${RNLLAMA_LIB_DIR}/common/jinja/*.cpp)
+file(GLOB MODEL_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/models/*.cpp)
+file(GLOB GGML_CPU_C_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/ggml-cpu/*.c)
+file(GLOB GGML_CPU_CPP_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/ggml-cpu/*.cpp)
+file(GLOB GGML_CPU_AMX_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/ggml-cpu/amx/*.cpp)
+file(GLOB LLAMA_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/llama*.cpp)
+file(GLOB MTMD_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/tools/mtmd/*.cpp)
+file(GLOB MTMD_MODEL_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/tools/mtmd/models/*.cpp)
+file(GLOB COMMON_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/common/*.cpp)
+file(GLOB JINJA_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/common/jinja/*.cpp)
+# Deux dossiers nés en amont après l'instantané d'août : sans eux, l'édition
+# de liens réclamait lm_ggml_compute_forward_mul_mat_tiled et les analyseurs
+# de discussion (2026-10-24).
+file(GLOB TILED_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/ggml-cpu/tiled/*.cpp)
+file(GLOB PARSERS_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/common/parsers/*.cpp)
+# `vendor/hash` de l'amont, que mtmd-helper.cpp appelle pour nommer les
+# bitmaps par leur empreinte SHA-256.
+file(GLOB HASH_FILES CONFIGURE_DEPENDS
+    ${RNLLAMA_LIB_DIR}/tools/mtmd/hash/*.cpp
+    ${RNLLAMA_LIB_DIR}/tools/mtmd/hash/sha256/*.c)
 
 # Source files for the shared library
 set(
@@ -69,6 +82,7 @@ set(
     ${RNLLAMA_LIB_DIR}/ggml-backend-dl.cpp
     # Nouveau fichier amont : les sources ggml sont listées à la main
     # ici (pas globbées), donc tout ajout en amont doit être repris.
+    ${RNLLAMA_LIB_DIR}/ggml.cpp
     ${RNLLAMA_LIB_DIR}/ggml-backend-meta.cpp
     ${RNLLAMA_LIB_DIR}/ggml-backend-reg.cpp
     ${RNLLAMA_LIB_DIR}/ggml-opt.cpp
@@ -93,6 +107,9 @@ set(
 
     # Jinja template engine
     ${JINJA_FILES}
+    ${TILED_FILES}
+    ${PARSERS_FILES}
+    ${HASH_FILES}
 
     # Multimodal support (globbed)
     ${MTMD_MODEL_FILES}
