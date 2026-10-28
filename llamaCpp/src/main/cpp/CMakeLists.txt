@@ -18,8 +18,18 @@ set(CMAKE_JOB_POOL_LINK link_pool)
 set(CMAKE_JOB_POOL_COMPILE compile_pool)
 
 include_directories(
-    ${RNLLAMA_LIB_DIR}
+    # `common` AVANT la racine, et ce n'est pas un détail : l'arbre aplati
+    # contient DEUX fichiers nommés `unicode.h` — celui du tokeniseur, à la
+    # racine, et celui que l'amont a ajouté dans `common/` (octobre 2026). Un
+    # fichier de `common/jinja` qui écrit `#include "unicode.h"` veut le
+    # second ; avec la racine en premier il recevait le premier, et la
+    # compilation s'arrêtait sur `common_unicode_cpt_to_utf8` introuvable.
+    #
+    # Les fichiers de la racine, eux, ne risquent rien : pour une inclusion
+    # entre guillemets, le compilateur regarde d'abord le répertoire du
+    # fichier qui inclut, donc ils gardent leur propre `unicode.h`.
     ${RNLLAMA_LIB_DIR}/common
+    ${RNLLAMA_LIB_DIR}
     ${RNLLAMA_LIB_DIR}/common/jinja
     ${RNLLAMA_LIB_DIR}/ggml-cpu
     ${RNLLAMA_LIB_DIR}/tools/mtmd
@@ -126,13 +136,26 @@ set(
     # Model implementations (globbed)
     ${MODEL_FILES}
     
-    # Our JNI wrapper
-    ${CMAKE_SOURCE_DIR}/jni.cpp
 )
+
+# Le tronc commun ci-dessus ne contient AUCUN point d'entrée : deux cibles le
+# partagent, le pont JNI de la bibliothèque et l'exécutable natif.
+#
+# L'exécutable existe parce qu'un processus d'application finit toujours par
+# être classé puis sacrifié par Android : mesuré le 2026-10-25, le service du
+# modèle dans son propre processus mourait quand même (`importance=400` puis
+# `SIGKILL` hors de tout registre d'ActivityManager), 2,8 Go chargés. Un
+# exécutable lancé par le clavier n'est pas une application : il garde
+# l'`oom_score_adj` hérité au lancement, et n'embarque ni ART ni rien d'Android.
+set(SOURCE_FILES_JNI ${SOURCE_FILES} ${CMAKE_SOURCE_DIR}/jni.cpp)
+set(SOURCE_FILES_SERVEUR ${SOURCE_FILES} ${CMAKE_SOURCE_DIR}/serveur.cpp)
 
 find_library(LOG_LIB log)
 
-function(build_library target_name arch cpu_flags)
+# Configure une cible DÉJÀ créée : drapeaux processeur, backend OpenCL,
+# options d'édition de liens. Partagée par la bibliothèque et l'exécutable,
+# pour qu'aucun des deux ne dérive de l'autre.
+function(configurer_cible target_name arch cpu_flags)
     # Backend OpenCL (GPU Adreno) : activé pour les cibles dont le nom se
     # termine par `_opencl`, comme dans le CMake de production de
     # cui-llama.rn dont ce bloc est transposé. Une cible SÉPARÉE plutôt qu'un
@@ -143,23 +166,12 @@ function(build_library target_name arch cpu_flags)
         set(ENABLE_OPENCL ON)
     endif ()
 
-    if (NOT ${arch} STREQUAL "generic")
-        set(SOURCE_FILES_ARCH
-            ${RNLLAMA_LIB_DIR}/ggml-cpu/arch/${arch}/quants.c
-            ${RNLLAMA_LIB_DIR}/ggml-cpu/arch/${arch}/repack.cpp
-        )
-    endif ()
-
-    add_library(
-            ${target_name}
-            SHARED
-            ${SOURCE_FILES}
-            ${SOURCE_FILES_ARCH}
-    )
-
     target_link_libraries(${target_name} ${LOG_LIB} android)
 
     if (ENABLE_OPENCL)
+        # Connu d'emblée : il départage les noyaux (génériques pour le serveur
+        # natif) et le stub d'édition de liens (chemin absolu pour lui aussi).
+        get_target_property(genre_de_cible ${target_name} TYPE)
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
         target_include_directories(${target_name} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../../third_party/OpenCL-Headers)
@@ -194,18 +206,77 @@ function(build_library target_name arch cpu_flags)
             ${GGML_OPENCL_KERNEL_HEADERS})
         target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
-        target_compile_options(${target_name} PRIVATE
+        # Les noyaux spécifiques Adreno : dans la bibliothèque, PAS dans le
+        # serveur natif. C'est eux qui plantaient.
+        #
+        # Enquête du 2026-10-25. Symptôme : sur le GPU, le processus était tué
+        # (`SIGKILL`) systématiquement au DEUXIÈME jeton — le premier sort, qui
+        # vient de la passe d'invite. Invariant par rapport aux couches
+        # déportées (1 à 29), à l'attention éclair, à la taille de lot (64 à
+        # 512), à la fenêtre, au cache de noyaux, et aux réglages d'exécution
+        # `MM_*`, `XMEM_*`, `DISABLE_FUSION`.
+        #
+        # Bissection à l'opération près avec `LM_GGML_OPENCL_OPFILTER`, qui
+        # refuse au GPU les ops dont le nom correspond :
+        #
+        #   ROPE, SOFT_MAX, FLASH_ATTN, CPY, GET_ROWS, MUL_MAT_ID → toujours tué
+        #   MUL_MAT                                               → ABOUTIT
+        #
+        # Le noyau fautif est donc la multiplication de matrices, et seulement
+        # dans sa version Adreno : compilé sans
+        # `LM_GGML_OPENCL_USE_ADRENO_KERNELS`, le serveur mène à bien ses
+        # générations avec 4, 15 puis 29 couches sur 29 déportées.
+        #
+        # Contrepartie mesurée, à ne pas enjoliver : le chemin générique donne
+        # 4,4 jetons/s contre 23,7 au processeur sur cet appareil (Qwen2.5-1.5B,
+        # chargement déduit). Les noyaux rapides sont justement ceux qui
+        # plantent. Le GPU fonctionne, il n'est pas encore rentable ici.
+        set(OPENCL_DEFS
             -DLM_GGML_USE_OPENCL
-            -DLM_GGML_OPENCL_USE_ADRENO_KERNELS
             -DLM_GGML_OPENCL_EMBED_KERNELS
             -DLM_GGML_OPENCL_SOA_Q
             -DLM_GGML_OPENCL_TARGET_VERSION=300)
+        # Les noyaux Adreno restent RÉSERVÉS à la bibliothèque JNI.
+        #
+        # Réessayé le 2026-10-25 sur llama.cpp b11880, qui apportait pourtant
+        # « opencl: add several gemm variants for small batches and some
+        # fixes » : le processus est toujours tué au deuxième jeton
+        # (`SIGKILL`, code 137). Le défaut du noyau `MUL_MAT` version Adreno,
+        # isolé par bissection avec `LM_GGML_OPENCL_OPFILTER`, n'est donc pas
+        # corrigé en amont. Le chemin générique, lui, mène ses générations à
+        # bien avec 29 couches sur 29.
+        if (NOT genre_de_cible STREQUAL "EXECUTABLE")
+            list(APPEND OPENCL_DEFS -DLM_GGML_OPENCL_USE_ADRENO_KERNELS)
+        endif ()
+        target_compile_options(${target_name} PRIVATE ${OPENCL_DEFS})
 
-        # On lie contre un STUB de `libOpenCL.so` (produit par
-        # `scripts/build-opencl.sh` de cui-llama.rn) : à l'exécution, c'est le
+        # On lie contre un STUB de `libOpenCL.so` : à l'exécution, c'est le
         # vrai pilote du téléphone, `/vendor/lib64/libOpenCL.so`, qui est
         # chargé. Le stub ne sert qu'à satisfaire l'éditeur de liens.
-        set(OPENCL_STUB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../bin/${ANDROID_ABI})
+        #
+        # Deux stubs, selon le genre de cible, et la différence est tout le
+        # sujet (mesuré le 2026-10-25) :
+        #
+        #  - une BIBLIOTHÈQUE est chargée dans un processus d'application, à
+        #    qui le linker Android monte l'espace de noms « sphal » : la
+        #    dépendance « libOpenCL.so » s'y résout par son nom ;
+        #  - un EXÉCUTABLE lancé par l'application n'a pas cet espace de noms.
+        #    « libOpenCL.so » n'est alors trouvée nulle part, et ajouter
+        #    /vendor/lib64 à LD_LIBRARY_PATH fait chercher au linker TOUTES les
+        #    bibliothèques là-dedans, dont libc++.so, dont la copie du
+        #    constructeur tire des bibliothèques privées que l'application n'a
+        #    pas le droit de mapper (« libbinderdebug.so phdr mmap failed:
+        #    Permission denied »).
+        #
+        # Le stub de `bin/${ANDROID_ABI}-absolu` porte donc comme SONAME le
+        # CHEMIN ABSOLU du pilote : le linker charge ce fichier-là, sans rien
+        # chercher, et ses propres dépendances (libc++, libc, libm, libdl)
+        # viennent du système. Voir scripts/stub-opencl-absolu.sh.
+        if (genre_de_cible STREQUAL "EXECUTABLE")
+            set(OPENCL_STUB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../bin/${ANDROID_ABI}-absolu)
+        else ()
+            set(OPENCL_STUB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../bin/${ANDROID_ABI})
+        endif ()
         if (EXISTS ${OPENCL_STUB_DIR}/libOpenCL.so)
             target_link_directories(${target_name} PRIVATE ${OPENCL_STUB_DIR})
             target_link_libraries(${target_name} OpenCL)
@@ -246,6 +317,37 @@ function(build_library target_name arch cpu_flags)
 endfunction()
 
 
+# Les sources propres à une architecture, communes aux deux fabriques.
+function(sources_arch arch sortie)
+    set(fichiers "")
+    if (NOT ${arch} STREQUAL "generic")
+        set(fichiers
+            ${RNLLAMA_LIB_DIR}/ggml-cpu/arch/${arch}/quants.c
+            ${RNLLAMA_LIB_DIR}/ggml-cpu/arch/${arch}/repack.cpp
+        )
+    endif ()
+    set(${sortie} ${fichiers} PARENT_SCOPE)
+endfunction()
+
+function(build_library target_name arch cpu_flags)
+    sources_arch(${arch} arch_files)
+    add_library(${target_name} SHARED ${SOURCE_FILES_JNI} ${arch_files})
+    configurer_cible(${target_name} ${arch} "${cpu_flags}")
+endfunction()
+
+# L'exécutable porte un nom en `lib*.so` : Android n'autorise l'exécution que
+# depuis le répertoire des bibliothèques natives de l'application, et n'y
+# extrait que les fichiers qui ressemblent à des bibliothèques. C'en est un
+# par le nom seulement.
+function(build_executable target_name arch cpu_flags)
+    sources_arch(${arch} arch_files)
+    add_executable(${target_name} ${SOURCE_FILES_SERVEUR} ${arch_files})
+    set_target_properties(${target_name} PROPERTIES
+        PREFIX "lib"
+        SUFFIX ".so")
+    configurer_cible(${target_name} ${arch} "${cpu_flags}")
+endfunction()
+
 # Default target (no specific CPU features)
 build_library("rnllama" "generic" "")
 
@@ -260,6 +362,24 @@ if (${ANDROID_ABI} STREQUAL "arm64-v8a")
     # OpenCL. Elle s'ajoute aux variantes CPU au lieu de les remplacer, pour
     # qu'un appareil sans OpenCL exploitable garde un chemin qui fonctionne.
     build_library("rnllama_v8_2_dotprod_i8mm_opencl" "arm" "-march=armv8.2-a+dotprod+i8mm")
+    # Le serveur natif, en deux exécutables. Le GPU est le chemin NORMAL ; le
+    # second ne sert que si le pilote du téléphone refuse de se charger dans un
+    # processus qui n'est pas une application — ce qui ne se devine pas à la
+    # compilation et ne doit pas priver l'utilisateur d'IA locale.
+    #
+    # Pas un oubli, une mesure (2026-10-25) : le pilote OpenCL du téléphone
+    # tire des bibliothèques privées du constructeur. Un processus
+    # d'application y accède par l'espace de noms que le linker Android lui
+    # monte ; un exécutable nu, non. Le lancer avec `/vendor/lib64` dans
+    # LD_LIBRARY_PATH donne « /vendor/lib64/libbinderdebug.so phdr mmap
+    # failed: Permission denied » — SELinux, et rien à y faire de ce côté.
+    #
+    # Le GPU reste accessible par la bibliothèque JNI, dans le service de
+    # secours. Et c'est le processeur qui a produit les seuls jetons jamais
+    # mesurés sur cet appareil : 3,53 par seconde, là où le GPU n'a jamais
+    # tenu jusqu'au premier.
+    build_executable("llm_serveur_opencl" "arm" "-march=armv8.2-a+dotprod+i8mm")
+    build_executable("llm_serveur" "arm" "-march=armv8.2-a+dotprod+i8mm")
     # Add other variants if needed, mirroring cui-llama.rn
 elseif (${ANDROID_ABI} STREQUAL "x86_64")
     # x86_64 target

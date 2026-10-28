@@ -292,6 +292,16 @@ Java_org_nehuatl_llamacpp_LlamaContext_initContextWithFd(
     defaultParams.cpuparams.n_threads =
             n_threads > 0 ? n_threads : auto_threads;
 
+    // llama.cpp monte maintenant ses files de fils dans le constructeur de
+    // `common_init_result`, et sans garde-fou : la file de lot hérite du -1
+    // que portent les paramètres par défaut, réclame 544 octets x -1 octets de
+    // travailleurs, et écrit dans le pointeur nul que l'allocateur renvoie.
+    // L'exécutable amont normalise ces champs pendant l'analyse de ses
+    // arguments ; nous n'y passons pas, donc on le fait ici : la file de lot
+    // prend le compte de fils de la file ordinaire.
+    postprocess_cpu_params(defaultParams.cpuparams);
+    postprocess_cpu_params(defaultParams.cpuparams_batch, &defaultParams.cpuparams);
+
     defaultParams.n_gpu_layers = n_gpu_layers;
     // llama.cpp a remplacé les deux booléens `use_mmap`/`use_mlock` par un
     // seul `load_mode`. On traduit ici plutôt que côté Kotlin : l'API de la
